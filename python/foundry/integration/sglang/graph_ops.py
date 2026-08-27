@@ -310,6 +310,28 @@ def initialize_attention_metadata_for_bs(cuda_graph_runner, bs: int) -> None:
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
         )
         attn_backend.init_forward_metadata_out_graph(fake_fb, in_capture=True)
+    elif hasattr(attn_backend, "init_forward_metadata_out_graph"):
+        # Composite / other post-#26735 backends (e.g. HybridLinearAttnBackend
+        # wrapping fa3 + KDA for hybrid linear-attention models): drive the
+        # backend's own capture-time init through the same ForwardBatch
+        # stand-in. Their out_graph reads batch_size / req_pool_indices /
+        # forward_mode / spec_info (seq_lens_cpu is ignored when
+        # in_capture=True).
+        from types import SimpleNamespace
+
+        fake_fb = SimpleNamespace(
+            batch_size=bs,
+            positions=buffers.positions[:num_tokens],
+            req_pool_indices=buffers.req_pool_indices[:bs],
+            seq_lens=buffers.seq_lens[:bs],
+            seq_lens_cpu=None,
+            seq_lens_sum=None,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            out_cache_loc=buffers.out_cache_loc[:num_tokens],
+        )
+        attn_backend.init_forward_metadata_out_graph(fake_fb, in_capture=True)
     else:
         raise RuntimeError(
             "[Foundry] attention backend "
