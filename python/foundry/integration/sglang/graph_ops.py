@@ -261,15 +261,46 @@ def initialize_attention_metadata_for_bs(cuda_graph_runner, bs: int) -> None:
     num_tokens = bs * cuda_graph_runner.num_tokens_per_bs
     encoder_lens = buffers.encoder_lens[:bs] if cuda_graph_runner.is_encoder_decoder else None
     spec_info = cuda_graph_runner.get_spec_info(num_tokens)
-    cuda_graph_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
-        bs,
-        num_tokens,
-        buffers.req_pool_indices[:bs],
-        buffers.seq_lens[:bs],
-        encoder_lens,
-        cuda_graph_runner.capture_forward_mode,
-        spec_info,
-    )
+    attn_backend = cuda_graph_runner.attn_backend
+    forward_mode = cuda_graph_runner.capture_forward_mode
+    legacy_init = getattr(attn_backend, "init_forward_metadata_capture_cuda_graph", None)
+    if legacy_init is not None:
+        # Pre-#26735 sglang: one call does allocation + indices update.
+        legacy_init(
+            bs,
+            num_tokens,
+            buffers.req_pool_indices[:bs],
+            buffers.seq_lens[:bs],
+            encoder_lens,
+            forward_mode,
+            spec_info,
+        )
+    elif hasattr(attn_backend, "_prepare_cuda_graph_metadata"):
+        # Post-#26735 FlashInfer: allocation lives in _prepare_cuda_graph_metadata
+        # (wrapper construction — the VMM-visible part). The indices updater runs
+        # later via init_forward_metadata_out_graph at capture/replay time; in
+        # cuda-graph mode wrappers are built with fixed buffers, so plan() itself
+        # allocates nothing and can be deferred.
+        attn_backend._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
+    elif hasattr(attn_backend, "_bind_metadata_buffers"):
+        # Post-#26735 fa3: per-bs metadata are slice views over the fixed
+        # init_cuda_graph_state workspace — no VMM impact, but replay looks
+        # them up in decode_cuda_graph_metadata[bs], so populate the dicts.
+        attn_backend._bind_metadata_buffers(
+            bs,
+            num_tokens,
+            encoder_lens,
+            forward_mode,
+            spec_info,
+            buffers.seq_lens.device,
+        )
+    else:
+        raise RuntimeError(
+            "[Foundry] attention backend "
+            f"{type(attn_backend).__name__} exposes neither the legacy "
+            "init_forward_metadata_capture_cuda_graph nor a known post-#26735 "
+            "preparation hook (_prepare_cuda_graph_metadata / _bind_metadata_buffers)"
+        )
 
 
 def initialize_all_attention_metadata(cuda_graph_runner) -> None:

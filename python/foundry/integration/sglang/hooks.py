@@ -33,6 +33,29 @@ def _ep_lazy_init_needed() -> bool:
         return False
 
 
+def _pre_capture_warmup_needed(cuda_graph_runner) -> bool:
+    """True when foundry's suppressed warmup forwards would have triggered
+    lazy init that must not fire inside stream capture.
+
+    Two known sources:
+    - DeepEP EP: NVSHMEM buffer creation + DeepGEMM per-shape JIT.
+    - TP > 1: the tensor-parallel path runs @torch.compile'd helpers that
+      single-GPU/DP never hit (e.g. vocab_parallel_embedding's
+      get_masked_input_and_mask). Their first call inductor-compiles and
+      copies CPU constants to device — illegal inside the capture window
+      ("Cannot copy between CPU and CUDA tensors during CUDA graph
+      capture"). NCCL/pynccl first-collective lazy init rides along too.
+    """
+    if _ep_lazy_init_needed():
+        return True
+    tp_size = getattr(
+        getattr(cuda_graph_runner, "model_runner", None), "tp_size", None
+    )
+    if tp_size is None:
+        tp_size = getattr(cuda_graph_runner, "tp_size", 1)
+    return (tp_size or 1) > 1
+
+
 def _resolve_dp_rank(model_runner) -> int | None:
     dp_rank = getattr(model_runner, "dp_rank", None)
     if dp_rank is not None:
@@ -341,10 +364,27 @@ def _patch_cuda_graph_capture() -> None:
         #     ("invalid device context"). So warmup is SAVE-only.
         # bootstrap_deepep_buffer runs on both (cheap singleton) to guarantee the
         # NVSHMEM runtime is up before replay on LOAD / before capture on SAVE.
-        if _ep_lazy_init_needed():
+        if _pre_capture_warmup_needed(self):
             if mode == CUDAGraphExtensionMode.SAVE:
                 _run_warmup_pass(self)
-            if mode != CUDAGraphExtensionMode.NONE:
+            elif mode == CUDAGraphExtensionMode.LOAD and not _ep_lazy_init_needed():
+                # TP: the captured allreduce kernels reference NCCL P2P/IPC
+                # transport buffers that SAVE's warmup pass established
+                # lazily (first collective) BEFORE capture. Skipping warmup
+                # on LOAD leaves that transport unestablished — the graph
+                # addresses are mapped by preallocate, so replay silently
+                # reads meaningless memory: prefill (eager) is correct,
+                # decode emits garbage. Re-run the same warmup pass at the
+                # same lifecycle point so pynccl/NCCL connects with the
+                # same deterministic allocation trajectory as SAVE (warmup
+                # activations precede the pre-pass wrappers in cursor
+                # order, so a partial warmup would desync the cursor).
+                # EP keeps the documented LOAD-skip: DeepEP/NVSHMEM state
+                # is handled via bootstrap_deepep_buffer, and re-entering
+                # graph_capture() there breaks threaded graph loads.
+                _run_warmup_pass(self)
+            # DeepEP buffer bootstrap stays EP-only (no-op / crash for dense TP).
+            if _ep_lazy_init_needed() and mode != CUDAGraphExtensionMode.NONE:
                 from foundry.integration.sglang.graph_ops import (
                     bootstrap_deepep_buffer,
                 )
@@ -422,7 +462,19 @@ def _patch_cuda_graph_capture() -> None:
             # FlashInfer by its per-bs indices_updater_decode.
             attn_backend = self.attn_backend
             use_fi_prepass = hasattr(attn_backend, "indices_updater_decode")
-            real_init = attn_backend.init_forward_metadata_capture_cuda_graph
+            # Post-#26735 sglang removed the legacy per-bs capture API in favor
+            # of ``init_forward_metadata_out_graph(fb, in_capture)`` which
+            # delegates allocation to ``_prepare_cuda_graph_metadata``. Support
+            # both eras: on the new ABC the reuse shim wraps _prepare_ instead.
+            legacy_capture_api = hasattr(
+                attn_backend, "init_forward_metadata_capture_cuda_graph"
+            )
+            real_init = (
+                attn_backend.init_forward_metadata_capture_cuda_graph
+                if legacy_capture_api
+                else None
+            )
+            real_prepare = None
 
             def reuse_pre_pass_init(
                 bs,
@@ -536,11 +588,52 @@ def _patch_cuda_graph_capture() -> None:
                 # Drop the pre-pass's last forward_metadata ref so popping the dict
                 # entry doesn't keep the wrapper alive at refcount 1.
                 attn_backend.forward_metadata = None
-                attn_backend.init_forward_metadata_capture_cuda_graph = reuse_pre_pass_init
+                if legacy_capture_api:
+                    attn_backend.init_forward_metadata_capture_cuda_graph = (
+                        reuse_pre_pass_init
+                    )
+                else:
+                    # New ABC (post-#26735): out_graph(in_capture=True) calls
+                    # _prepare_cuda_graph_metadata (allocation) then runs the
+                    # indices updater with decode_cuda_graph_metadata[bs].
+                    # Reuse shim: skip the allocation when the pre-pass already
+                    # populated the dict; mirror _prepare's forward_metadata
+                    # assignment; fall through to real _prepare otherwise.
+                    real_prepare = attn_backend._prepare_cuda_graph_metadata
+
+                    def reuse_prepare(bs, num_tokens, forward_mode, spec_info):
+                        from sglang.srt.layers.attention.flashinfer_backend import (
+                            DecodeMetadata,
+                            PrefillMetadata,
+                        )
+
+                        if forward_mode.is_decode_or_idle():
+                            wrappers = attn_backend.decode_cuda_graph_metadata.get(bs)
+                            if wrappers is not None:
+                                attn_backend.forward_metadata = DecodeMetadata(wrappers)
+                                return
+                        elif (
+                            forward_mode.is_target_verify()
+                            or forward_mode.is_draft_extend()
+                            or forward_mode.is_dllm_extend()
+                        ):
+                            wrappers = attn_backend.prefill_cuda_graph_metadata.get(bs)
+                            if wrappers is not None:
+                                attn_backend.forward_metadata = PrefillMetadata(
+                                    wrappers, forward_mode.is_dllm_extend(), False
+                                )
+                                return
+                        return real_prepare(bs, num_tokens, forward_mode, spec_info)
+
+                    attn_backend._prepare_cuda_graph_metadata = reuse_prepare
             try:
                 result = orig_capture(self, *args, **kwargs)
             finally:
-                attn_backend.init_forward_metadata_capture_cuda_graph = real_init
+                if use_fi_prepass:
+                    if legacy_capture_api:
+                        attn_backend.init_forward_metadata_capture_cuda_graph = real_init
+                    elif real_prepare is not None:
+                        attn_backend._prepare_cuda_graph_metadata = real_prepare
 
             from foundry.integration.sglang.graph_ops import (
                 pack_fatbins,
