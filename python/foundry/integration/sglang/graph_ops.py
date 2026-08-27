@@ -140,7 +140,9 @@ def start_graph_builds() -> None:
 
     paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
     t0 = time.perf_counter()
-    pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
+    pending = FoundryCUDAGraph.start_graph_builds(
+        paths, num_threads=int(os.environ.get("FOUNDRY_GRAPH_LOAD_THREADS", "4"))
+    )
     _pending_graph_builds = (pending, graph_files)
     logger.info(
         "[Foundry] Started SGLang graph builds for %d graphs in %.3fs",
@@ -283,17 +285,31 @@ def initialize_attention_metadata_for_bs(cuda_graph_runner, bs: int) -> None:
         # allocates nothing and can be deferred.
         attn_backend._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
     elif hasattr(attn_backend, "_bind_metadata_buffers"):
-        # Post-#26735 fa3: per-bs metadata are slice views over the fixed
-        # init_cuda_graph_state workspace — no VMM impact, but replay looks
-        # them up in decode_cuda_graph_metadata[bs], so populate the dicts.
-        attn_backend._bind_metadata_buffers(
-            bs,
-            num_tokens,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-            buffers.seq_lens.device,
+        # Post-#26735 fa3: replay looks per-bs metadata up in
+        # decode_cuda_graph_metadata[bs], so LOAD must reproduce the FULL
+        # capture-time init — not just _bind_metadata_buffers. The capture
+        # branch of init_forward_metadata_out_graph additionally runs
+        # _apply_cuda_graph_metadata and the local-attn / scheduler-metadata
+        # setup; skipping those left metadata.scheduler_metadata unset and
+        # corrupted the first decode steps for some sequence lengths
+        # (observed as one garbled token then recovery on Qwen3-30B EP/fa3).
+        # Call the backend's own capture path with a minimal ForwardBatch
+        # stand-in so future fa3 changes are picked up automatically.
+        from types import SimpleNamespace
+
+        fake_fb = SimpleNamespace(
+            batch_size=bs,
+            positions=buffers.positions[:num_tokens],
+            req_pool_indices=buffers.req_pool_indices[:bs],
+            seq_lens=buffers.seq_lens[:bs],
+            seq_lens_cpu=None,
+            seq_lens_sum=None,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            out_cache_loc=buffers.out_cache_loc[:num_tokens],
         )
+        attn_backend.init_forward_metadata_out_graph(fake_fb, in_capture=True)
     else:
         raise RuntimeError(
             "[Foundry] attention backend "
@@ -343,7 +359,9 @@ def load_all_graphs(cuda_graph_runner) -> None:
 
     paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
     t0 = time.perf_counter()
-    pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
+    pending = FoundryCUDAGraph.start_graph_builds(
+        paths, num_threads=int(os.environ.get("FOUNDRY_GRAPH_LOAD_THREADS", "4"))
+    )
     results = FoundryCUDAGraph.finish_graph_loads(pending)
     logger.info(
         "[Foundry] Loaded %d SGLang graphs in %.3fs",

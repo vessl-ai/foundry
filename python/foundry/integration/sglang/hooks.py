@@ -183,6 +183,10 @@ def _patch_init_memory_pool() -> None:
             if not state.memory_pool_config:
                 raise RuntimeError("Foundry LOAD requires memory_pool_config")
             self.memory_pool_config = MemoryPoolConfig(**state.memory_pool_config)
+            # Hybrid linear-attention models: restore SAVE-resolved
+            # server_args values (max_mamba_cache_size etc.) that the
+            # skipped init would otherwise have computed.
+            rt.apply_server_args_overrides(self.server_args, state.server_args_overrides)
             # Mirror SAVE's ``_resolve_memory_pool_config`` ->
             # ``get_available_gpu_memory(empty_cache=True)`` side
             # effect. Without this, torch's caching allocator retains
@@ -199,7 +203,10 @@ def _patch_init_memory_pool() -> None:
         rt.log_alloc_offset("before_init_memory_pool")
         result = orig(self, pre_model_load_memory)
         rt.log_alloc_offset("after_init_memory_pool")
-        state = rt.create_warmup_state(asdict(self.memory_pool_config))
+        state = rt.create_warmup_state(
+            asdict(self.memory_pool_config),
+            rt.collect_server_args_overrides(self.server_args),
+        )
         rt.save_warmup_state(state)
         return result
 
@@ -367,7 +374,14 @@ def _patch_cuda_graph_capture() -> None:
         if _pre_capture_warmup_needed(self):
             if mode == CUDAGraphExtensionMode.SAVE:
                 _run_warmup_pass(self)
-            elif mode == CUDAGraphExtensionMode.LOAD and not _ep_lazy_init_needed():
+            elif mode == CUDAGraphExtensionMode.LOAD and (
+                os.environ.get("FOUNDRY_LOAD_WARMUP", "1") == "1"
+            ):
+                if _ep_lazy_init_needed():
+                    # EP validated with single-threaded graph builds only;
+                    # threaded finish_graph_loads after a warmup pass hit
+                    # "invalid device context" historically.
+                    os.environ.setdefault("FOUNDRY_GRAPH_LOAD_THREADS", "1")
                 # TP: the captured allreduce kernels reference NCCL P2P/IPC
                 # transport buffers that SAVE's warmup pass established
                 # lazily (first collective) BEFORE capture. Skipping warmup
@@ -379,9 +393,12 @@ def _patch_cuda_graph_capture() -> None:
                 # same deterministic allocation trajectory as SAVE (warmup
                 # activations precede the pre-pass wrappers in cursor
                 # order, so a partial warmup would desync the cursor).
-                # EP keeps the documented LOAD-skip: DeepEP/NVSHMEM state
-                # is handled via bootstrap_deepep_buffer, and re-entering
-                # graph_capture() there breaks threaded graph loads.
+                # EP: the same symmetric warmup also fixes a DP-rank-parity
+                # prefill corruption (one DP rank emitted nondeterministic
+                # garbage on the FIRST decode token — i.e. the prefill
+                # logits — while decode-graph replay was fine). Validated
+                # 12/12 identical to SAVE with dlogprob=0 under
+                # single-threaded graph builds (see below).
                 _run_warmup_pass(self)
             # DeepEP buffer bootstrap stays EP-only (no-op / crash for dense TP).
             if _ep_lazy_init_needed() and mode != CUDAGraphExtensionMode.NONE:

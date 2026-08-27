@@ -38,6 +38,11 @@ class WarmupState:
     gpu_total_memory: int = 0
     memory_pool_config: dict = field(default_factory=dict)
     final_alloc_offset: int = 0
+    # Hybrid linear-attention (mamba/KDA) models: the mamba pool size is
+    # computed from free memory during SAVE's init and written back into
+    # server_args — a path LOAD skips. Persist the resolved values so LOAD
+    # can restore them before _apply_memory_pool_config.
+    server_args_overrides: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -65,7 +70,34 @@ def _workspace_root() -> str | None:
     return None if cfg is None else cfg.workspace_root
 
 
-def create_warmup_state(memory_pool_config: dict | None = None) -> WarmupState:
+_SERVER_ARGS_PERSIST_KEYS = (
+    # Resolved by init_memory_pool from free memory on SAVE; LOAD skips that
+    # computation, so they must be replayed from the archive (hybrid
+    # linear-attention models crash in MambaPool(size=None) otherwise).
+    "max_mamba_cache_size",
+    "max_running_requests",
+    "max_total_tokens",
+)
+
+
+def collect_server_args_overrides(server_args) -> dict:
+    out = {}
+    for key in _SERVER_ARGS_PERSIST_KEYS:
+        val = getattr(server_args, key, None)
+        if val is not None:
+            out[key] = val
+    return out
+
+
+def apply_server_args_overrides(server_args, overrides: dict) -> None:
+    for key, val in (overrides or {}).items():
+        setattr(server_args, key, val)
+
+
+def create_warmup_state(
+    memory_pool_config: dict | None = None,
+    server_args_overrides: dict | None = None,
+) -> WarmupState:
     try:
         from sglang.version import __version__ as sglang_version
     except Exception:
@@ -79,6 +111,7 @@ def create_warmup_state(memory_pool_config: dict | None = None) -> WarmupState:
         gpu_name=props.name,
         gpu_total_memory=props.total_memory,
         memory_pool_config=memory_pool_config or {},
+        server_args_overrides=server_args_overrides or {},
     )
 
 
