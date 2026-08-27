@@ -28,6 +28,7 @@
 
 // #define FOUNDRY_DEBUG_REPLAY  // Uncomment for verbose on-demand replay logging
 
+#if !FOUNDRY_TORCH_GE_213
 namespace at {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wattributes"
@@ -112,6 +113,7 @@ __attribute__((visibility("hidden"))) void CUDAGeneratorImpl::unregister_graph(
 
 #pragma GCC diagnostic pop
 }  // namespace at
+#endif  // !FOUNDRY_TORCH_GE_213
 
 namespace foundry {
 
@@ -151,7 +153,12 @@ c10::intrusive_ptr<at::CUDAGeneratorState> CUDAGeneratorStateRegistry::get_state
   auto visit_fn = [&](const auto& value) { result_state = value.second; };
 
   if (!state_pool_.cvisit(id, visit_fn)) {
+#if !FOUNDRY_TORCH_GE_213
     result_state = c10::make_intrusive<at::CUDAGeneratorState>(seed, 0, 0);
+#else
+    // torch >= 2.13: CUDAGeneratorState(seed, philox_offset_per_thread)
+    result_state = c10::make_intrusive<at::CUDAGeneratorState>(seed, 0);
+#endif
     state_pool_.emplace(id, result_state);
   }
 
@@ -182,15 +189,24 @@ void CUDAGraph::register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorSta
 }
 
 void CUDAGraph::register_generator_state(const at::Generator& generator) {
+#if !FOUNDRY_TORCH_GE_213
   c10::intrusive_ptr<at::CUDAGeneratorImpl> cuda_gen =
       c10::dynamic_intrusive_pointer_cast<at::CUDAGeneratorImpl>(generator.getIntrusivePtr());
   cuda_gen->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(this));
+#else
+  (void)generator;  // generator integration is a no-op on torch >= 2.13
+#endif
 }
 
 void CUDAGraph::register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorState> state,
                                          uint64_t wholegraph_increment) {
+#if !FOUNDRY_TORCH_GE_213
   state->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(this));
   captured_generator_states_[state] = wholegraph_increment;
+#else
+  (void)state;
+  (void)wholegraph_increment;
+#endif
 }
 
 void CUDAGraph::capture_begin(MempoolId_t pool, cudaStreamCaptureMode capture_mode) {
@@ -198,6 +214,7 @@ void CUDAGraph::capture_begin(MempoolId_t pool, cudaStreamCaptureMode capture_mo
               "This CUDAGraph instance already owns a captured graph. "
               "To capture a new graph, create a new instance.");
 
+#if !FOUNDRY_TORCH_GE_213
   auto* gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
       std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
   gen->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(this));
@@ -205,6 +222,7 @@ void CUDAGraph::capture_begin(MempoolId_t pool, cudaStreamCaptureMode capture_mo
   for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
     generator_state->capture_prologue();
   }
+#endif
 
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -258,9 +276,11 @@ void CUDAGraph::capture_end() {
 
   TORCH_CHECK(graph_ != nullptr, "Invalid capture.");
 
+#if !FOUNDRY_TORCH_GE_213
   for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
     wholegraph_increments = generator_state->capture_epilogue();
   }
+#endif
 
   size_t numCUDAGraphNodes = 0;
   AT_CUDA_CHECK(cudaGraphGetNodes(graph_, nullptr, &numCUDAGraphNodes));
@@ -467,9 +487,11 @@ void CUDAGraph::replay() {
     }
 
     c10::OptionalDeviceGuard device_guard{c10::Device(c10::kCUDA, capture_dev_)};
+#if !FOUNDRY_TORCH_GE_213
     for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
       generator_state->replay_prologue(wholegraph_increments);
     }
+#endif
 #ifdef FOUNDRY_DEBUG_REPLAY
     fprintf(stderr, "[foundry DEBUG] graph %d: launching on stream %p...\n",
             on_demand_data_->graph_id, (void*)at::cuda::getCurrentCUDAStream().stream());
@@ -496,9 +518,11 @@ void CUDAGraph::replay() {
 
   c10::OptionalDeviceGuard device_guard{capture_stream_.device()};
 
+#if !FOUNDRY_TORCH_GE_213
   for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
     generator_state->replay_prologue(wholegraph_increments);
   }
+#endif
   AT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
 
   int version = 0;
@@ -614,9 +638,11 @@ MempoolId_t CUDAGraph::pool() {
 }
 
 CUDAGraph::~CUDAGraph() {
+#if !FOUNDRY_TORCH_GE_213
   for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
     generator_state->unregister_graph(reinterpret_cast<at::cuda::CUDAGraph*>(this));
   }
+#endif
   reset();
 
 #if (defined(USE_ROCM) && ROCM_VERSION >= 60200)
@@ -1535,8 +1561,12 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
     uint64_t wholegraph_increment = gen_obj.at("wholegraph_increment").to_number<uint64_t>();
 
     auto state = global_generator_state_registry.get_state_from_id(state_id, seed);
+#if !FOUNDRY_TORCH_GE_213
     state->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(graph.get()));
     graph->captured_generator_states_[state] = wholegraph_increment;
+#else
+    (void)wholegraph_increment;
+#endif
   }
 
   const json::object& allocator_events = root.at("allocator_events").as_object();

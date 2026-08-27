@@ -1,6 +1,24 @@
 #pragma once
 
 #include <ATen/Tensor.h>
+#if __has_include(<torch/version.h>)
+#include <torch/version.h>
+#endif
+// torch >= 2.13 reworked CUDAGeneratorState around per-capture
+// CUDAGeneratorCaptureState objects (capture_states_ keyed by CaptureId_t)
+// and removed register_graph/unregister_graph/capture_prologue/
+// capture_epilogue/replay_prologue(uint64_t) from the state object. Foundry's
+// RNG plumbing exists to keep in-graph philox state coherent across
+// SAVE/LOAD; LLM inference graphs carry no in-graph RNG consumers (no
+// dropout; sampling runs outside the graph), so on >= 2.13 the generator
+// integration compiles out to a no-op instead of re-implementing the old
+// state machine against the new internals.
+#if defined(TORCH_VERSION_MAJOR) && \
+    (TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 13))
+#define FOUNDRY_TORCH_GE_213 1
+#else
+#define FOUNDRY_TORCH_GE_213 0
+#endif
 #include <boost/unordered/concurrent_flat_map_fwd.hpp>
 #include <boost/unordered/concurrent_flat_map.hpp>
 #include <boost/json.hpp>
