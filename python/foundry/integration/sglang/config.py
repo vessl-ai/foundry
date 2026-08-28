@@ -16,6 +16,16 @@ class CUDAGraphExtensionMode(str, enum.Enum):
     NONE = "none"
     SAVE = "save"
     LOAD = "load"
+    # Decide per launch: restore a matching archive, otherwise bake one. The
+    # mode is resolved to SAVE or LOAD during install_hooks (see
+    # runtime.resolve_auto_mode), so nothing downstream ever sees AUTO.
+    AUTO = "auto"
+
+    @classmethod
+    def _missing_(cls, value):
+        if isinstance(value, str) and value.lower() in ("save_and_load", "auto"):
+            return cls.AUTO
+        return None
 
 
 @dataclass

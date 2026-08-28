@@ -43,6 +43,10 @@ class WarmupState:
     # server_args — a path LOAD skips. Persist the resolved values so LOAD
     # can restore them before _apply_memory_pool_config.
     server_args_overrides: dict = field(default_factory=dict)
+    # Everything an archive is pinned to (GPU arch, driver/torch/sglang
+    # versions, model, parallel layout, graph batch sizes, VMM region).
+    # AUTO mode refuses to restore an archive whose fingerprint differs.
+    fingerprint: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -108,9 +112,131 @@ def apply_server_args_overrides(server_args, overrides: dict) -> None:
                 )
 
 
+def _graph_signature(server_args) -> str:
+    """Stable description of which CUDA graphs a run will build.
+
+    v3 forks carry a `cuda_graph_config` dataclass; older trees expose the
+    batch-size list and cap directly. Either way the point is that an archive
+    baked for one set of shapes cannot serve another.
+    """
+    cfg = getattr(server_args, "cuda_graph_config", None)
+    if cfg is not None:
+        return str(cfg)
+    return str(
+        [
+            getattr(server_args, name, None)
+            for name in (
+                "cuda_graph_bs",
+                "cuda_graph_max_bs",
+                "disable_cuda_graph",
+                "disable_cuda_graph_padding",
+            )
+        ]
+    )
+
+
+def compute_archive_fingerprint(server_args) -> dict:
+    """Identify the (hardware, stack, model, layout) an archive belongs to."""
+    try:
+        from sglang.version import __version__ as sglang_version
+    except Exception:
+        sglang_version = "unknown"
+
+    props = torch.cuda.get_device_properties(0)
+    cfg = get_config()
+
+    def arg(name, default=None):
+        value = getattr(server_args, name, default)
+        return default if value is None else value
+
+    tp = int(arg("tp_size", 1))
+    pp = int(arg("pp_size", 1))
+    dp = int(arg("dp_size", 1))
+    world = pp * tp if arg("enable_dp_attention", False) else dp * tp * pp
+
+    return {
+        "gpu_name": props.name,
+        "compute_capability": f"{props.major}.{props.minor}",
+        "gpu_count": torch.cuda.device_count(),
+        "cuda": torch.version.cuda or "unknown",
+        "torch": torch.__version__,
+        "sglang": sglang_version,
+        "model_path": str(arg("model_path", "")),
+        "quantization": str(arg("quantization", "")),
+        "kv_cache_dtype": str(arg("kv_cache_dtype", "")),
+        "attention_backend": str(arg("attention_backend", "")),
+        "speculative_algorithm": str(arg("speculative_algorithm", "")),
+        "tp": tp,
+        "pp": pp,
+        "dp": dp,
+        "ep": int(arg("ep_size", 1)),
+        "world_size": world,
+        "graphs": _graph_signature(server_args),
+        "region": None
+        if cfg is None
+        else f"{cfg.base_addr:#x}/{cfg.region_size}/{cfg.scratch_space_size}",
+    }
+
+
+def _auto_decision(server_args) -> tuple[CUDAGraphExtensionMode, str]:
+    cfg = get_config()
+    root = Path(cfg.workspace_root)
+    if not (root / "warmup_state.json").exists():
+        return CUDAGraphExtensionMode.SAVE, f"no archive at {root}"
+
+    try:
+        state = load_warmup_state()
+    except Exception as exc:
+        return CUDAGraphExtensionMode.SAVE, f"unreadable archive ({exc})"
+
+    want = compute_archive_fingerprint(server_args)
+    have = state.fingerprint
+    if not have:
+        return CUDAGraphExtensionMode.SAVE, "archive predates fingerprinting"
+
+    mismatched = [k for k, v in want.items() if have.get(k) != v]
+    if mismatched:
+        detail = ", ".join(
+            f"{k}: archive={have.get(k)!r} run={want[k]!r}" for k in mismatched[:3]
+        )
+        return CUDAGraphExtensionMode.SAVE, f"fingerprint mismatch — {detail}"
+
+    # final_alloc_offset.json is written at the very end of a rank's capture,
+    # so its presence for every rank is what makes the archive complete.
+    incomplete = [
+        i
+        for i in range(int(want["world_size"]))
+        if not (root / f"rank_{i}" / "final_alloc_offset.json").exists()
+    ]
+    if incomplete:
+        return (
+            CUDAGraphExtensionMode.SAVE,
+            f"incomplete archive — ranks {incomplete[:4]} never finished capture",
+        )
+
+    return CUDAGraphExtensionMode.LOAD, f"complete matching archive ({state.timestamp})"
+
+
+def resolve_auto_mode(server_args) -> CUDAGraphExtensionMode:
+    """Turn AUTO into SAVE or LOAD before any hook consults the mode."""
+    cfg = get_config()
+    if cfg is None or cfg.mode != CUDAGraphExtensionMode.AUTO:
+        return None if cfg is None else cfg.mode
+
+    try:
+        decision, reason = _auto_decision(server_args)
+    except Exception as exc:  # never let mode resolution take the server down
+        decision, reason = CUDAGraphExtensionMode.SAVE, f"probe failed ({exc})"
+
+    cfg.mode = decision
+    logger.info("[Foundry] auto mode resolved to %s — %s", decision.value, reason)
+    return decision
+
+
 def create_warmup_state(
     memory_pool_config: dict | None = None,
     server_args_overrides: dict | None = None,
+    fingerprint: dict | None = None,
 ) -> WarmupState:
     try:
         from sglang.version import __version__ as sglang_version
@@ -126,6 +252,7 @@ def create_warmup_state(
         gpu_total_memory=props.total_memory,
         memory_pool_config=memory_pool_config or {},
         server_args_overrides=server_args_overrides or {},
+        fingerprint=fingerprint or {},
     )
 
 

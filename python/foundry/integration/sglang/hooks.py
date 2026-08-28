@@ -103,6 +103,9 @@ def install_hooks(server_args) -> None:
         )
 
     load_graph_extension_config(cfg_path)
+    # AUTO picks SAVE or LOAD from what is on disk; do it before any hook
+    # reads the mode so the rest of the integration sees a concrete one.
+    rt.resolve_auto_mode(server_args)
     logger.info(
         "[Foundry] SGLang hooks installing: mode=%s workspace=%s",
         get_graph_extension_mode().value,
@@ -186,11 +189,11 @@ def _patch_resolve_memory_pool_v3() -> None:
         rt.log_alloc_offset("before_resolve_memory_pool")
         config = orig(self, pre_model_load_memory)
         rt.log_alloc_offset("after_resolve_memory_pool")
+        sa = getattr(self, "server_args", None) or _current_server_args()
         state = rt.create_warmup_state(
             asdict(config),
-            rt.collect_server_args_overrides(
-                getattr(self, "server_args", None) or _current_server_args()
-            ),
+            rt.collect_server_args_overrides(sa),
+            rt.compute_archive_fingerprint(sa),
         )
         rt.save_warmup_state(state)
         return config
@@ -426,6 +429,7 @@ def _patch_init_memory_pool() -> None:
         state = rt.create_warmup_state(
             asdict(self.memory_pool_config),
             rt.collect_server_args_overrides(self.server_args),
+            rt.compute_archive_fingerprint(self.server_args),
         )
         rt.save_warmup_state(state)
         return result
