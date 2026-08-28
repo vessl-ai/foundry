@@ -27,6 +27,7 @@ namespace foundry {
 void set_allocation_region(void* base, size_t size);
 void stop_allocation_region();
 void resume_allocation_region();
+void set_sync_on_free(bool enabled);
 bool preallocate_region(size_t size);
 void free_preallocated_region();
 size_t get_current_alloc_offset();

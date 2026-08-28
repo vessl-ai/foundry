@@ -244,6 +244,15 @@ def preallocate_for_load_mode() -> None:
         cge.preallocate_region(remaining)
 
 
+def disable_sync_on_free() -> None:
+    """Drop the hook's device-sync-before-unmap once the multi-threaded
+    weight-loading phase is over — graph capture's alloc/free churn would
+    otherwise pay a full device sync per freed allocation."""
+    setter = getattr(cge, "set_sync_on_free", None)
+    if setter is not None:
+        setter(False)
+
+
 def log_alloc_offset(label: str) -> None:
     cfg = get_config()
     if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:

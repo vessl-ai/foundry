@@ -162,6 +162,10 @@ def _patch_resolve_memory_pool_v3() -> None:
         if mode == CUDAGraphExtensionMode.NONE:
             return orig(self, pre_model_load_memory)
 
+        # Weight loading (the multi-threaded phase the free-side device sync
+        # protects) is complete by the time the memory pool is resolved.
+        rt.disable_sync_on_free()
+
         if mode == CUDAGraphExtensionMode.LOAD:
             import torch
 
@@ -386,6 +390,10 @@ def _patch_init_memory_pool() -> None:
         mode = get_graph_extension_mode()
         if mode == CUDAGraphExtensionMode.NONE:
             return orig(self, pre_model_load_memory)
+
+        # Weight loading (the multi-threaded phase the free-side device sync
+        # protects) is complete by the time the memory pool is resolved.
+        rt.disable_sync_on_free()
 
         if mode == CUDAGraphExtensionMode.LOAD:
             import torch

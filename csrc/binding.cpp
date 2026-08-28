@@ -34,6 +34,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Resume previously set allocation region for CUDA VMM hooks");
 
   m.def(
+      "set_sync_on_free", [](bool enabled) { ::foundry::set_sync_on_free(enabled); },
+      py::arg("enabled"),
+      "Toggle the device synchronize performed before unmapping freed VMM "
+      "allocations (needed only while multi-threaded CUDA work is in flight)");
+
+  m.def(
       "preallocate_region", [](size_t size) { return ::foundry::preallocate_region(size); },
       py::arg("size"),
       "Preallocate memory in the allocation region for fast subsequent allocations");

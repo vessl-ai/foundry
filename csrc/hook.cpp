@@ -265,6 +265,7 @@ struct ThreadLocalStorage {
 // A single recursive mutex serializes the allocation fast/slow paths; driver
 // calls dominate their cost, so the lock is noise.
 static ThreadLocalStorage tls_storage;
+static std::atomic<bool> g_sync_on_free{true};
 static std::recursive_mutex g_alloc_state_mutex;
 #define FOUNDRY_ALLOC_LOCK() \
   std::lock_guard<std::recursive_mutex> _foundry_alloc_lock(g_alloc_state_mutex)
@@ -2799,8 +2800,11 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
       // Real cuMemFree guarantees in-flight work using the allocation has
       // completed before the memory is released; cuMemUnmap gives no such
       // guarantee, so unmapping immediately faults async consumers (e.g.
-      // multi-threaded weight loading racing an empty_cache()).
-      if (getenv("FOUNDRY_NO_SYNC_ON_FREE") == nullptr) {
+      // multi-threaded weight loading racing an empty_cache()). Integrations
+      // may turn this off once the multi-threaded load phase is over
+      // (set_sync_on_free) — graph capture alloc/free churn otherwise pays a
+      // device sync per free.
+      if (g_sync_on_free.load() && getenv("FOUNDRY_NO_SYNC_ON_FREE") == nullptr) {
         typedef CUresult (*cuCtxSynchronize_t)();
         auto ctx_sync_func = (cuCtxSynchronize_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
                                                                   CUDA_ENTRY_cuCtxSynchronize);
@@ -3327,6 +3331,8 @@ void stop_allocation_region() {
   fprintf(stderr, "[HOOK] Allocation region stopped\n");
 #endif
 }
+
+void set_sync_on_free(bool enabled) { g_sync_on_free.store(enabled); }
 
 void resume_allocation_region() {
   FOUNDRY_ALLOC_LOCK();
