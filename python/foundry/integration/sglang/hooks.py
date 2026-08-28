@@ -109,15 +109,222 @@ def install_hooks(server_args) -> None:
         get_workspace_root(),
     )
 
+    era = _detect_engine_era()
     _patch_init_torch_distributed()
-    _patch_init_memory_pool()
-    _patch_load_model()
-    _patch_kernel_warmup()
-    _patch_cuda_graph_capture()
+    if era == "v3":
+        # Post runner-backend refactor (runner/ + runner_backend/ split, e.g.
+        # the vessl-ai production fork): memory pool resolution lives in
+        # KVCacheConfigurator and graph capture behind FullCudaGraphBackend.
+        _patch_resolve_memory_pool_v3()
+        _patch_cuda_graph_capture_v3()
+    else:
+        _patch_init_memory_pool()
+        _patch_load_model()
+        _patch_kernel_warmup()
+        _patch_cuda_graph_capture()
     _patch_spawn_sites()
 
     _INSTALLED = True
-    logger.info("[Foundry] SGLang hooks installed")
+    logger.info("[Foundry] SGLang hooks installed (engine era: %s)", era)
+
+
+def _detect_engine_era() -> str:
+    """v3 = runner/runner_backend refactor; v2 = monolithic CudaGraphRunner."""
+    try:
+        import sglang.srt.model_executor.runner_backend.full_cuda_graph_backend  # noqa: F401
+
+        return "v3"
+    except Exception:
+        return "v2"
+
+
+def _patch_resolve_memory_pool_v3() -> None:
+    """SAVE persists the profiled MemoryPoolConfig; LOAD replays it.
+
+    In the v3 engine, `KVCacheConfigurator.configure` calls
+    `_resolve_memory_pool_config(pre_model_load_memory)` which profiles free
+    GPU memory — non-reproducible across runs. Everything downstream of the
+    resolved config (`_derive_pool_sizes` -> `_init_pools`) is deterministic,
+    so replaying just the resolved config on LOAD keeps the allocation
+    trajectory identical to SAVE.
+    """
+    from dataclasses import asdict
+
+    from sglang.srt.mem_cache import kv_cache_configurator as kcc
+    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+
+    cls = kcc.KVCacheConfigurator
+    orig = cls._resolve_memory_pool_config
+
+    @functools.wraps(orig)
+    def patched(self, pre_model_load_memory):
+        mode = get_graph_extension_mode()
+        if mode == CUDAGraphExtensionMode.NONE:
+            return orig(self, pre_model_load_memory)
+
+        if mode == CUDAGraphExtensionMode.LOAD:
+            import torch
+
+            rt.log_alloc_offset("before_resolve_memory_pool")
+            state = rt.load_warmup_state()
+            if not state.memory_pool_config:
+                raise RuntimeError("Foundry LOAD requires memory_pool_config")
+            rt.apply_server_args_overrides(
+                getattr(self, "server_args", None) or _current_server_args(),
+                state.server_args_overrides,
+            )
+            # Mirror SAVE's free-memory profile side effect on the caching
+            # allocator (see the v2 hook for the full rationale).
+            torch.cuda.empty_cache()
+            logger.info("[Foundry] SGLang reused saved memory pool config (v3)")
+            return MemoryPoolConfig(**state.memory_pool_config)
+
+        rt.log_alloc_offset("before_resolve_memory_pool")
+        config = orig(self, pre_model_load_memory)
+        rt.log_alloc_offset("after_resolve_memory_pool")
+        state = rt.create_warmup_state(
+            asdict(config),
+            rt.collect_server_args_overrides(
+                getattr(self, "server_args", None) or _current_server_args()
+            ),
+        )
+        rt.save_warmup_state(state)
+        return config
+
+    cls._resolve_memory_pool_config = patched
+
+
+def _current_server_args():
+    from sglang.srt.server_args import get_global_server_args
+
+    try:
+        return get_global_server_args()
+    except Exception:
+        return None
+
+
+def _patch_cuda_graph_capture_v3() -> None:
+    """v3 capture/load seams.
+
+    SAVE: wrap `FullCudaGraphBackend.capture_one` — skip the two warmup
+    forwards (their non-deterministic activation allocations poison the
+    caching allocator relative to LOAD), capture into a foundry graph, and
+    save it keyed by ShapeKey.size. Post-capture, write the manifest, pack
+    fatbins and record the final VMM watermark.
+
+    LOAD: let the upstream `capture()` run unchanged — `warmup()`, buffer
+    prep, per-shape `capture_prepare` and `init_forward_metadata_out_graph`
+    all execute exactly as on SAVE (symmetric allocation trajectory for
+    free) — but `capture_one` neither runs the forward nor captures: after
+    the loop, all archived graphs are loaded in one pass and slotted into
+    the backend's `_graphs`/`_outputs` maps, which `replay()` reads.
+    """
+    from sglang.srt.model_executor.runner import decode_cuda_graph_runner as dcgr
+    from sglang.srt.model_executor.runner_backend import (
+        full_cuda_graph_backend as fcgb,
+    )
+
+    backend_cls = fcgb.FullCudaGraphBackend
+    runner_cls = dcgr.DecodeCudaGraphRunner
+    orig_capture_one = backend_cls.capture_one
+    orig_capture = runner_cls.capture
+
+    @functools.wraps(orig_capture_one)
+    def patched_capture_one(
+        self, shape_key, forward_fn, capture_inputs=None, post_warmup_hook=None
+    ):
+        mode = get_graph_extension_mode()
+        if mode == CUDAGraphExtensionMode.NONE:
+            return orig_capture_one(
+                self,
+                shape_key,
+                forward_fn,
+                capture_inputs=capture_inputs,
+                post_warmup_hook=post_warmup_hook,
+            )
+
+        TORCH_CHECK = (
+            shape_key.stream_idx is None
+            and shape_key.variant_label is None
+            and shape_key.dsa_variant is None
+        )
+        if not TORCH_CHECK:
+            raise RuntimeError(
+                f"[Foundry] unsupported ShapeKey variant for persistence: {shape_key}"
+            )
+
+        if mode == CUDAGraphExtensionMode.LOAD:
+            # No forward, no capture — graphs are restored after the loop by
+            # the runner-level patch below. Register the key order so the
+            # post-pass can validate coverage.
+            _v3_load_keys.append(shape_key)
+            return
+
+        # SAVE: skip the 2 warmup forwards; capture directly with foundry.
+        from foundry.integration.sglang.graph_ops import (
+            capture_graph,
+            create_device_graph,
+            save_graph,
+        )
+
+        self._device_module.synchronize()
+        self._tp_group.barrier()
+        graph = create_device_graph()
+        out = capture_graph(graph, self._pool, self._capture_stream, forward_fn)
+        save_graph(graph, out, shape_key.size)
+        self._graphs[shape_key] = graph
+        self._outputs[shape_key] = out
+
+    _v3_load_keys: list = []
+
+    @functools.wraps(orig_capture)
+    def patched_capture(self):
+        mode = get_graph_extension_mode()
+        if mode == CUDAGraphExtensionMode.NONE:
+            return orig_capture(self)
+
+        if mode == CUDAGraphExtensionMode.LOAD:
+            rt.log_alloc_offset("before_preallocate")
+            rt.preallocate_for_load_mode()
+            rt.log_alloc_offset("after_preallocate")
+
+        _v3_load_keys.clear()
+        result = orig_capture(self)
+
+        if mode == CUDAGraphExtensionMode.SAVE:
+            from foundry.integration.sglang.graph_ops import (
+                pack_fatbins,
+                save_graph_manifest,
+            )
+
+            save_graph_manifest()
+            pack_fatbins()
+            rt.capture_final_alloc_offset()
+            return result
+
+        # LOAD: restore every archived graph and slot into the backend maps.
+        from foundry.integration.sglang.graph_ops import load_all_graphs_v3
+
+        backend = self.backend
+        load_all_graphs_v3(backend, list(_v3_load_keys))
+        rt.log_alloc_offset("after_load_all_graphs")
+        return result
+
+    backend_cls.capture_one = patched_capture_one
+    runner_cls.capture = patched_capture
+
+
+def _runner_parallel_ranks(model_runner):
+    """Rank triple across engine eras: v3 forks keep ranks on a ParallelState
+    object (model_runner.ps); older trees expose them directly."""
+    ps = getattr(model_runner, "ps", None)
+    if ps is not None:
+        return ps.tp_rank, getattr(ps, "pp_rank", 0), getattr(ps, "dp_rank", None)
+    return (
+        model_runner.tp_rank,
+        model_runner.pp_rank,
+        _resolve_dp_rank(model_runner),
+    )
 
 
 def _patch_init_torch_distributed() -> None:
@@ -146,13 +353,18 @@ def _patch_init_torch_distributed() -> None:
 
             torch.get_device_module(self.device).set_device(self.gpu_id)
 
+        tp_rank, pp_rank, dp_rank = _runner_parallel_ranks(self)
         rt.setup_graph_extension(
             self.server_args,
-            tp_rank=self.tp_rank,
-            pp_rank=self.pp_rank,
-            dp_rank=_resolve_dp_rank(self),
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
         )
         rt.log_alloc_offset("after_setup_graph_ext")
+        # NCCL buffers stay inside the VMM region (deterministic offsets);
+        # the hook refuses legacy IPC export for region memory, steering
+        # NCCL onto its SHM transport so no peer pointers end up inside
+        # captured graphs. See cuIpcGetMemHandle in hook.cpp.
         result = orig(self, *args, **kwargs)
         rt.log_alloc_offset("after_init_torch_dist")
         rt.skip_to_scratch_boundary()

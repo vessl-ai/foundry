@@ -62,6 +62,7 @@ enum CudaDriverAPIIndex {
   CUDA_ENTRY_cuMemAddressFree,
   CUDA_ENTRY_cuMemGetAllocationGranularity,
   CUDA_ENTRY_cuCtxGetDevice,
+  CUDA_ENTRY_cuCtxSynchronize,
   CUDA_ENTRY_cuLibraryGetKernelCount,
   CUDA_ENTRY_cuLibraryEnumerateKernels,
   CUDA_ENTRY_cuKernelGetName,
@@ -108,6 +109,7 @@ static cuda_driver_entry_t cuda_driver_entry_table[] = {{nullptr, "cuModuleLoadD
                                                         {nullptr, "cuMemAddressFree"},
                                                         {nullptr, "cuMemGetAllocationGranularity"},
                                                         {nullptr, "cuCtxGetDevice"},
+                                                        {nullptr, "cuCtxSynchronize"},
                                                         {nullptr, "cuLibraryGetKernelCount"},
                                                         {nullptr, "cuLibraryEnumerateKernels"},
                                                         {nullptr, "cuKernelGetName"},
@@ -186,6 +188,13 @@ static std::atomic<bool> skip_fatbin_processing{false};
 static boost::unordered::concurrent_flat_map<uint64_t, std::variant<ModuleHandles, LibraryHandles>>
     binary_hash_to_handles;
 static boost::unordered::concurrent_flat_map<uint64_t, BinaryMetadata> binary_hash_to_metadata;
+// Deferred kernel catalogs: archives whose packed image cannot expose the
+// expected kernels on this stack (e.g. NCCL device-kernel fatbins that reject
+// device linking). The catalog is filled in when the runtime itself loads the
+// real library (LOAD-mode warmup brings NCCL up before graphs are built).
+static boost::unordered::concurrent_flat_map<uint64_t, std::vector<std::string>>
+    pending_kernel_catalog;
+static std::atomic<bool> has_pending_catalog{false};
 
 struct VariantHash {
   std::size_t operator()(const std::variant<CUmodule, CUlibrary>& v) const {
@@ -248,7 +257,36 @@ struct ThreadLocalStorage {
         device_cached(false) {}
 };
 
-static thread_local ThreadLocalStorage tls_storage;
+// Process-global (NOT thread_local): modern engines (torch >= 2.13 /
+// runner-refactor sglang forks) allocate model weights and pools from worker
+// threads. With per-thread state those threads see an uninitialized region
+// and every allocation silently falls outside the deterministic VMM range
+// (observed: cuMemMap failures at 0x5200000 and a wrapped final offset).
+// A single recursive mutex serializes the allocation fast/slow paths; driver
+// calls dominate their cost, so the lock is noise.
+static ThreadLocalStorage tls_storage;
+static std::recursive_mutex g_alloc_state_mutex;
+#define FOUNDRY_ALLOC_LOCK() \
+  std::lock_guard<std::recursive_mutex> _foundry_alloc_lock(g_alloc_state_mutex)
+
+#include <execinfo.h>
+// FOUNDRY_CURSOR_PROBE: temporary diagnostics for the cursor-pollution bug —
+// fires whenever the allocation cursor leaves the configured region.
+static void foundry_cursor_probe(int line) {
+  if (!tls_storage.region_initialized || tls_storage.region.base == nullptr) return;
+  size_t base = (size_t)tls_storage.region.base;
+  size_t end = base + tls_storage.region.size;
+  size_t cur = tls_storage.current_alloc_base_addr;
+  if (cur >= base && cur <= end) return;
+  fprintf(stderr,
+          "[HOOK] CURSOR-POLLUTION pid=%d hook.cpp:%d cursor=0x%zx region=[0x%zx,0x%zx)\n",
+          (int)getpid(), line, cur, base, end);
+  void* bt[48];
+  int n = backtrace(bt, 48);
+  backtrace_symbols_fd(bt, n, 2);
+}
+#define FOUNDRY_CURSOR_PROBE() foundry_cursor_probe(__LINE__)
+
 static std::once_flag default_allocation_region_flag;
 static boost::unordered::concurrent_flat_map<CUdeviceptr, AllocMetadata> global_alloc_metadata;
 static boost::unordered::concurrent_flat_map<CUdeviceptr, size_t> global_carved_reserve_metadata;
@@ -267,6 +305,10 @@ static std::mutex hook_events_mutex;
 static CUdeviceptr hook_recording_start_base_addr{0};
 
 static inline size_t align_to(size_t addr, size_t alignment) {
+  // alignment == 0 means "driver default" for callers like
+  // cuMemAddressReserve (torch symmetric memory passes 0); the bitwise
+  // round-up would collapse the address to 0 in that case.
+  if (alignment <= 1) return addr;
   return (addr + alignment - 1) & ~(alignment - 1);
 }
 
@@ -553,6 +595,48 @@ static std::string library_option_value_to_string(CUlibraryOption opt, void* val
           static_cast<int>(opt));
       abort();
   }
+}
+
+// Compute the same content hash dump_fatbin_and_info would produce for an
+// image, without recording any metadata. Used to match runtime library loads
+// against pending (deferred) kernel catalogs in LOAD mode.
+static uint64_t probe_image_hash(const void* data_ptr) {
+  const BinaryFormat format = detect_binary_format(data_ptr);
+  const uint8_t* binary_data = nullptr;
+  size_t total_size = 0;
+  std::vector<uint8_t> concatenated;
+  if (format == BinaryFormat::WRAPPER) {
+    const auto* wrapper = static_cast<const __fatBinC_Wrapper_t*>(data_ptr);
+    if (wrapper->version == FATBINC_VERSION) {
+      binary_data = reinterpret_cast<const uint8_t*>(wrapper->data);
+      total_size = compute_fatbin_size(binary_data);
+    } else if (wrapper->version == FATBINC_LINK_VERSION) {
+      auto** fatbin_array = static_cast<void**>(wrapper->filename_or_fatbins);
+      if (!fatbin_array || !fatbin_array[0]) return 0;
+      size_t num_fatbins = 0;
+      for (void** ptr = fatbin_array; *ptr != nullptr; ptr++) num_fatbins++;
+      if (num_fatbins == 1) {
+        binary_data = static_cast<const uint8_t*>(fatbin_array[0]);
+        total_size = compute_fatbin_size(binary_data);
+      } else {
+        for (size_t i = 0; i < num_fatbins; i++) {
+          const uint8_t* fb_data = static_cast<const uint8_t*>(fatbin_array[i]);
+          size_t fb_size = compute_fatbin_size(fb_data);
+          concatenated.insert(concatenated.end(), fb_data, fb_data + fb_size);
+        }
+        binary_data = concatenated.data();
+        total_size = concatenated.size();
+      }
+    } else {
+      return 0;
+    }
+  } else {
+    binary_data = static_cast<const uint8_t*>(data_ptr);
+    total_size = compute_fatbin_size(binary_data);
+  }
+  if (!binary_data || total_size == 0) return 0;
+  std::vector<uint8_t> vec(binary_data, binary_data + total_size);
+  return compute_hash(vec);
 }
 
 static void dump_fatbin_and_info(const void* data_ptr, std::string_view func_name,
@@ -1449,8 +1533,16 @@ static void setup_handles_for_library(CUlibrary library, uint64_t hash,
   }
 
   if (kernel_count != expected_names.size()) {
-    fprintf(stderr, "[HOOK] ERROR: Kernel count mismatch for hash %016llx: got %u, expected %zu\n",
+    fprintf(stderr,
+            "[HOOK] WARNING: Kernel count mismatch for hash %016llx: got %u, expected %zu — "
+            "deferring catalog until the runtime loads the real library\n",
             (unsigned long long)hash, kernel_count, expected_names.size());
+    pending_kernel_catalog.insert_or_assign(
+        hash, std::vector<std::string>(expected_names.begin(), expected_names.end()));
+    has_pending_catalog.store(true);
+    return;
+  }
+  if (false) {
 
     // Debug: enumerate and print all kernels that ARE available
     if (kernel_count > 0) {
@@ -1549,7 +1641,11 @@ static std::vector<uint8_t> prelink_fatbin_segments(
     return {};
   }
 
-  // Add each segment to the linker
+  // Add each segment to the linker. Some fatbins interleave segments that
+  // carry no binary for the current GPU (CUDA_ERROR_NO_BINARY_FOR_GPU, e.g.
+  // NCCL device-kernel images built for other archs) — skip those instead
+  // of abandoning the whole link.
+  size_t added = 0;
   for (size_t i = 0; i < segments.size(); i++) {
     const auto& segment = segments[i];
     res = link_add_data(link_state, CU_JIT_INPUT_FATBINARY, const_cast<uint8_t*>(segment.data()),
@@ -1557,11 +1653,16 @@ static std::vector<uint8_t> prelink_fatbin_segments(
     if (res != CUDA_SUCCESS) {
       fprintf(
           stderr,
-          "[HOOK] WARNING: cuLinkAddData failed for segment %zu with error %d during pre-link\n", i,
+          "[HOOK] WARNING: cuLinkAddData skipped segment %zu (error %d) during pre-link\n", i,
           res);
-      link_destroy(link_state);
-      return {};
+      continue;
     }
+    added++;
+  }
+  if (added == 0) {
+    fprintf(stderr, "[HOOK] WARNING: no linkable segments during pre-link\n");
+    link_destroy(link_state);
+    return {};
   }
 
   // Complete linking
@@ -1624,6 +1725,19 @@ static void pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
         // Pre-linking succeeded - clear NEEDS_DEVICE_LINK, will be stored as normal binary
         binary_flags &= ~BINARY_FLAG_NEEDS_DEVICE_LINK;
         has_segments = false;
+      } else if (!metadata.binary_data.empty()) {
+        // Pre-linking failed but we hold the original image the process
+        // actually loaded from (e.g. cutlass fatbins whose collected
+        // segments the CUDA linker rejects with NO_BINARY_FOR_GPU).
+        // Persist the original image as a normal binary instead of
+        // shipping segments that LOAD cannot link either.
+        binary_flags &= ~BINARY_FLAG_NEEDS_DEVICE_LINK;
+        has_segments = false;
+        fprintf(stderr,
+                "[HOOK] INFO: pre-link failed for hash %016llx; packing original image "
+                "(%zu bytes) instead of %zu segments\n",
+                (unsigned long long)hash, metadata.binary_data.size(),
+                metadata.linked_fatbin_segments.size());
       }
     }
 
@@ -1953,10 +2067,32 @@ CUresult cuLibraryLoadData(CUlibrary* library, const void* code, CUjit_option* j
   auto real_func =
       (cuLibraryLoadData_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuLibraryLoadData);
 
-  // Skip heavy processing in LOAD mode for faster startup
+  // Skip heavy processing in LOAD mode for faster startup — but still match
+  // runtime loads against deferred kernel catalogs (see pending_kernel_catalog).
   if (skip_fatbin_processing.load()) {
-    return real_func(library, code, jitOptions, jitOptionsValues, numJitOptions, libraryOptions,
-                     libraryOptionValues, numLibraryOptions);
+    CUresult skip_res = real_func(library, code, jitOptions, jitOptionsValues, numJitOptions,
+                                  libraryOptions, libraryOptionValues, numLibraryOptions);
+    if (skip_res == CUDA_SUCCESS && library && *library && has_pending_catalog.load()) {
+      const uint64_t h = probe_image_hash(code);
+      bool matched = false;
+      std::vector<std::string> names;
+      if (h != 0) {
+        pending_kernel_catalog.cvisit(h, [&](const auto& kv) {
+          matched = true;
+          names = kv.second;
+        });
+      }
+      if (matched) {
+        fprintf(stderr,
+                "[HOOK] INFO: resolving deferred kernel catalog for hash %016llx from runtime "
+                "library load\n",
+                (unsigned long long)h);
+        setup_handles_for_library(*library, h, names, false);
+        pending_kernel_catalog.erase(h);
+        if (pending_kernel_catalog.empty()) has_pending_catalog.store(false);
+      }
+    }
+    return skip_res;
   }
 
   const int idx = dumped_binary_counter.fetch_add(1);
@@ -2244,6 +2380,7 @@ CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion, cu
 }
 
 CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
+  FOUNDRY_ALLOC_LOCK();
   typedef CUresult (*cuMemAlloc_t)(CUdeviceptr*, size_t);
   auto real_func =
       (cuMemAlloc_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemAlloc_v2);
@@ -2289,6 +2426,7 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
 
     global_alloc_metadata.emplace(*dptr, metadata);
     tls_storage.current_alloc_base_addr = align_to(*dptr + bytesize, kAllocAlignment);
+    FOUNDRY_CURSOR_PROBE();
 
     if (hook_recording_enabled.load()) {
       std::lock_guard<std::mutex> lock(hook_events_mutex);
@@ -2317,6 +2455,7 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
     if (already_allocated) {
       *dptr = target_addr;
       tls_storage.current_alloc_base_addr = align_to(*dptr + bytesize, kAllocAlignment);
+      FOUNDRY_CURSOR_PROBE();
 
       if (hook_recording_enabled.load()) {
         std::lock_guard<std::mutex> lock(hook_events_mutex);
@@ -2422,6 +2561,7 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
 
   global_alloc_metadata.emplace(*dptr, metadata);
   tls_storage.current_alloc_base_addr = align_to(*dptr + bytesize, kAllocAlignment);
+  FOUNDRY_CURSOR_PROBE();
 
   if (hook_recording_enabled.load()) {
     std::lock_guard<std::mutex> lock(hook_events_mutex);
@@ -2442,6 +2582,7 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
 
 CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInBytes, size_t Height,
                             unsigned int ElementSizeBytes) {
+  FOUNDRY_ALLOC_LOCK();
   typedef CUresult (*cuMemAllocPitch_t)(CUdeviceptr*, size_t*, size_t, size_t, unsigned int);
   auto real_func =
       (cuMemAllocPitch_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemAllocPitch_v2);
@@ -2505,6 +2646,7 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInByt
 
     global_alloc_metadata.emplace(*dptr, metadata);
     tls_storage.current_alloc_base_addr = align_to(*dptr + total_size, kAllocAlignment);
+    FOUNDRY_CURSOR_PROBE();
 
     if (hook_recording_enabled.load()) {
       std::lock_guard<std::mutex> lock(hook_events_mutex);
@@ -2604,6 +2746,7 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInByt
 
   global_alloc_metadata.emplace(*dptr, metadata);
   tls_storage.current_alloc_base_addr = align_to(*dptr + total_size, kAllocAlignment);
+  FOUNDRY_CURSOR_PROBE();
 
   if (hook_recording_enabled.load()) {
     std::lock_guard<std::mutex> lock(hook_events_mutex);
@@ -2624,6 +2767,7 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInByt
 }
 
 CUresult cuMemFree_v2(CUdeviceptr dptr) {
+  FOUNDRY_ALLOC_LOCK();
   typedef CUresult (*cuMemFree_t)(CUdeviceptr);
   auto real_func = (cuMemFree_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemFree_v2);
 
@@ -2651,6 +2795,17 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
       typedef CUresult (*cuMemAddressFree_t)(CUdeviceptr, size_t);
       auto mem_addr_free_func = (cuMemAddressFree_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
                                                                      CUDA_ENTRY_cuMemAddressFree);
+
+      // Real cuMemFree guarantees in-flight work using the allocation has
+      // completed before the memory is released; cuMemUnmap gives no such
+      // guarantee, so unmapping immediately faults async consumers (e.g.
+      // multi-threaded weight loading racing an empty_cache()).
+      if (getenv("FOUNDRY_NO_SYNC_ON_FREE") == nullptr) {
+        typedef CUresult (*cuCtxSynchronize_t)();
+        auto ctx_sync_func = (cuCtxSynchronize_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
+                                                                  CUDA_ENTRY_cuCtxSynchronize);
+        if (ctx_sync_func) ctx_sync_func();
+      }
 
       mem_unmap_func(metadata.ptr, metadata.size);
       mem_release_func(metadata.handle);
@@ -2682,6 +2837,7 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
 
 CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CUdeviceptr addr,
                              unsigned long long flags) {
+  FOUNDRY_ALLOC_LOCK();
   typedef CUresult (*cuMemAddressReserve_t)(CUdeviceptr*, size_t, size_t, CUdeviceptr,
                                             unsigned long long);
   auto real_func = (cuMemAddressReserve_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
@@ -2704,12 +2860,15 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
 
   constexpr size_t kSmallAllocThreshold = 2ULL << 30;
   if (size < kSmallAllocThreshold) {
+    // alignment == 0 asks for the driver default; carve at the region
+    // granularity so the recorded event replays identically on LOAD.
+    if (alignment == 0) alignment = kAllocAlignment;
     CUdeviceptr aligned_addr = align_to(tls_storage.current_alloc_base_addr, alignment);
 
     size_t region_base = (size_t)tls_storage.region.base;
     size_t region_end = region_base + tls_storage.region.size;
 
-    if (aligned_addr + size > region_end) {
+    if (aligned_addr < region_base || aligned_addr + size > region_end) {
       fprintf(stderr,
               "[HOOK] ERROR: Not enough space in reserved region for allocation (size=0x%zx, "
               "available=0x%llx)\n",
@@ -2719,6 +2878,7 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
 
     *ptr = aligned_addr;
     tls_storage.current_alloc_base_addr = align_to(aligned_addr + size, kAllocAlignment);
+    FOUNDRY_CURSOR_PROBE();
 
     global_carved_reserve_metadata.emplace(*ptr, size);
 
@@ -2773,6 +2933,7 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
 }
 
 CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
+  FOUNDRY_ALLOC_LOCK();
   typedef CUresult (*cuMemAddressFree_t)(CUdeviceptr, size_t);
   auto real_func =
       (cuMemAddressFree_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemAddressFree);
@@ -2879,7 +3040,17 @@ CUresult cuIpcGetMemHandle(CUipcMemHandle* pHandle, CUdeviceptr dptr) {
   });
 
   if (found && metadata.handle != 0) {
-    // This is a VMM allocation - export via shareable handle
+    // VMM allocation. The legacy shareable-handle scheme below smuggles a
+    // POSIX fd through CUipcMemHandle, which cannot cross the process
+    // boundary (peer import fails with error 999) — and mapping the peer's
+    // buffer at its original VA collides with our own region under a shared
+    // base. Refuse IPC for region memory instead: NCCL treats this as
+    // "IPC unavailable" and falls back to its SHM transport, whose staging
+    // buffers stay rank-local (and deterministic) — exactly what captured
+    // graphs need.
+    if (getenv("FOUNDRY_VMM_IPC_EXPORT") == nullptr) {
+      return CUDA_ERROR_NOT_SUPPORTED;
+    }
     typedef CUresult (*cuMemExportToShareableHandle_t)(
         void*, CUmemGenericAllocationHandle, CUmemAllocationHandleType, unsigned long long);
     auto export_func = (cuMemExportToShareableHandle_t)CUDA_DRIVER_CALL(
@@ -3086,6 +3257,12 @@ namespace foundry {
 void free_preallocated_region();
 
 void set_allocation_region(void* base, size_t size) {
+  FOUNDRY_ALLOC_LOCK();
+#ifdef HOOK_DEBUG
+  fprintf(stderr, "[HOOK] set_allocation_region pid=%d base=%p size=%zu (prev base=%p cursor=0x%zx)\n",
+          (int)getpid(), base, size, tls_storage.region.base,
+          tls_storage.current_alloc_base_addr);
+#endif
   size_t aligned_base = align_to((size_t)base, kAllocAlignment);
   if (aligned_base != (size_t)base) {
     fprintf(stderr,
@@ -3131,6 +3308,7 @@ void set_allocation_region(void* base, size_t size) {
   tls_storage.region.base = (void*)aligned_base;
   tls_storage.region.size = size;
   tls_storage.current_alloc_base_addr = aligned_base;
+  FOUNDRY_CURSOR_PROBE();
   tls_storage.current_vmm_reserve_addr = align_to(aligned_base + size, kAllocAlignment);
   tls_storage.enabled = true;
   tls_storage.region_initialized = true;
@@ -3142,6 +3320,7 @@ void set_allocation_region(void* base, size_t size) {
 }
 
 void stop_allocation_region() {
+  FOUNDRY_ALLOC_LOCK();
   tls_storage.enabled = false;
 
 #ifdef HOOK_DEBUG
@@ -3150,6 +3329,7 @@ void stop_allocation_region() {
 }
 
 void resume_allocation_region() {
+  FOUNDRY_ALLOC_LOCK();
   tls_storage.enabled = true;
 
 #ifdef HOOK_DEBUG
@@ -3159,6 +3339,7 @@ void resume_allocation_region() {
 }
 
 bool preallocate_region(size_t size) {
+  FOUNDRY_ALLOC_LOCK();
   if (!tls_storage.region_initialized) {
     fprintf(stderr, "[HOOK] ERROR: Cannot preallocate before allocation region is set\n");
     return false;
@@ -3275,6 +3456,7 @@ bool preallocate_region(size_t size) {
 }
 
 void free_preallocated_region() {
+  FOUNDRY_ALLOC_LOCK();
   if (!tls_storage.has_preallocation) {
     return;
   }
@@ -3300,6 +3482,7 @@ void free_preallocated_region() {
 }
 
 size_t get_current_alloc_offset() {
+  FOUNDRY_ALLOC_LOCK();
   if (!tls_storage.region_initialized) {
     return 0;
   }
@@ -3307,6 +3490,7 @@ size_t get_current_alloc_offset() {
 }
 
 void set_current_alloc_offset(size_t offset) {
+  FOUNDRY_ALLOC_LOCK();
   if (!tls_storage.region_initialized) {
     fprintf(stderr, "[HOOK] ERROR: Cannot set offset before allocation region is initialized\n");
     return;
@@ -3335,6 +3519,8 @@ void set_current_alloc_offset(size_t offset) {
   }
 
   tls_storage.current_alloc_base_addr = new_alloc_addr;
+
+  FOUNDRY_CURSOR_PROBE();
   // NOTE: Do NOT update current_vmm_reserve_addr here.
   // current_alloc_base_addr tracks the cursor WITHIN the foundry region.
   // current_vmm_reserve_addr tracks where the NEXT cuMemAddressReserve
@@ -3398,6 +3584,7 @@ void replay_hook_events_from_json(const boost::json::object& events_obj) {
     uint64_t start_base_addr = events_obj.at("start_base_addr").to_number<uint64_t>();
     if (start_base_addr >= tls_storage.current_alloc_base_addr) {
       tls_storage.current_alloc_base_addr = static_cast<CUdeviceptr>(start_base_addr);
+      FOUNDRY_CURSOR_PROBE();
     } else {
       // LOAD mode consumed more memory than SAVE mode before graph loading.
       // This means allocations happened in a different order or additional allocations
@@ -3464,6 +3651,8 @@ void replay_hook_events_from_json(const boost::json::object& events_obj) {
       size_t alignment = event_obj.at("alignment").to_number<uint64_t>();
       uint64_t expected_ptr = event_obj.at("ptr").to_number<uint64_t>();
 
+      // Mirror the SAVE-side carve: alignment 0 means driver default.
+      if (alignment == 0) alignment = kAllocAlignment;
       CUdeviceptr aligned_addr = align_to(tls_storage.current_alloc_base_addr, alignment);
 
       if (aligned_addr != expected_ptr) {
@@ -3474,6 +3663,8 @@ void replay_hook_events_from_json(const boost::json::object& events_obj) {
       }
 
       tls_storage.current_alloc_base_addr = align_to(aligned_addr + size, kAllocAlignment);
+
+      FOUNDRY_CURSOR_PROBE();
 
 #ifdef HOOK_DEBUG
       fprintf(stderr, "[REPLAY] OK: Reserved %zu bytes at 0x%llx (pointer advance only)\n", size,
@@ -3982,56 +4173,100 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
                   binary.linked_segments.size(), (unsigned long long)binary.hash);
 #endif
 
+          // Some libraries collect relocatable-looking segments that the CUDA
+          // linker cannot actually consume (e.g. cutlass fatbins whose first
+          // segment has no binary for this GPU -> CUDA_ERROR_NO_BINARY_FOR_GPU).
+          // SAVE already tolerates this ("pre-link failed" pack) and the
+          // original payload is stored alongside the segments, so mirror that
+          // leniency here: on any link failure fall back to loading the
+          // original image exactly the way the SAVE-time process did.
+          bool link_failed = false;
           CUlinkState link_state;
           res = link_create(num_jit, jit_opts, jit_vals, &link_state);
           if (res != CUDA_SUCCESS) {
-            fprintf(stderr, "[HOOK] ERROR: cuLinkCreate failed with error %d\n", res);
-            abort();
+            fprintf(stderr, "[HOOK] WARNING: cuLinkCreate failed with error %d\n", res);
+            link_failed = true;
           }
 
-          // Add each segment to the linker
-          for (size_t i = 0; i < binary.linked_segments.size(); i++) {
+          // Add each segment to the linker; skip segments with no binary for
+          // this GPU (mirrors the SAVE-side pre-link leniency).
+          size_t added_segments = 0;
+          for (size_t i = 0; !link_failed && i < binary.linked_segments.size(); i++) {
             auto& segment = binary.linked_segments[i];
             res = link_add_data(link_state, CU_JIT_INPUT_FATBINARY,
                                 const_cast<uint8_t*>(segment.data()), segment.size(), nullptr, 0,
                                 nullptr, nullptr);
             if (res != CUDA_SUCCESS) {
-              fprintf(stderr, "[HOOK] ERROR: cuLinkAddData failed for segment %zu with error %d\n",
-                      i, res);
-              link_destroy(link_state);
-              abort();
+              fprintf(stderr,
+                      "[HOOK] WARNING: cuLinkAddData skipped segment %zu (error %d)\n", i, res);
+              continue;
             }
+            added_segments++;
 #ifdef HOOK_DEBUG
             fprintf(stderr, "[HOOK] DEBUG:   Added segment %zu (%zu bytes) to linker\n", i,
                     segment.size());
 #endif
           }
+          if (!link_failed && added_segments == 0) {
+            fprintf(stderr, "[HOOK] WARNING: no linkable segments for hash %016llx\n",
+                    (unsigned long long)binary.hash);
+            link_destroy(link_state);
+            link_failed = true;
+          }
 
           // Complete linking
           void* cubin_out = nullptr;
           size_t cubin_size = 0;
-          res = link_complete(link_state, &cubin_out, &cubin_size);
-          if (res != CUDA_SUCCESS || !cubin_out) {
-            fprintf(stderr, "[HOOK] ERROR: cuLinkComplete failed with error %d\n", res);
-            link_destroy(link_state);
-            abort();
+          if (!link_failed) {
+            res = link_complete(link_state, &cubin_out, &cubin_size);
+            if (res != CUDA_SUCCESS || !cubin_out) {
+              fprintf(stderr, "[HOOK] WARNING: cuLinkComplete failed with error %d\n", res);
+              link_destroy(link_state);
+              link_failed = true;
+            }
           }
 #ifdef HOOK_DEBUG
           fprintf(stderr, "[HOOK] DEBUG: Device linking complete, output size: %zu bytes\n",
                   cubin_size);
 #endif
 
-          // Load the linked cubin as a library
-          res = library_load_data(&library, cubin_out, jit_opts, jit_vals, num_jit, lib_opts,
-                                  lib_vals, num_lib);
-          link_destroy(link_state);
+          if (!link_failed) {
+            // Load the linked cubin as a library
+            res = library_load_data(&library, cubin_out, jit_opts, jit_vals, num_jit, lib_opts,
+                                    lib_vals, num_lib);
+            link_destroy(link_state);
+            if (res != CUDA_SUCCESS || !library) {
+              fprintf(
+                  stderr,
+                  "[HOOK] WARNING: Failed to load device-linked library for hash %016llx, "
+                  "error=%d, falling back to original image\n",
+                  (unsigned long long)binary.hash, res);
+              link_failed = true;
+              library = nullptr;
+            }
+          }
 
-          if (res != CUDA_SUCCESS || !library) {
-            fprintf(
-                stderr,
-                "[HOOK] ERROR: Failed to load device-linked library for hash %016llx, error=%d\n",
-                (unsigned long long)binary.hash, res);
-            abort();
+          if (link_failed) {
+            if (binary.data.empty()) {
+              fprintf(stderr,
+                      "[HOOK] ERROR: link fallback impossible — no original payload for hash "
+                      "%016llx\n",
+                      (unsigned long long)binary.hash);
+              abort();
+            }
+            res = library_load_data(&library, binary.data.data(), jit_opts, jit_vals, num_jit,
+                                    lib_opts, lib_vals, num_lib);
+            if (res != CUDA_SUCCESS || !library) {
+              fprintf(stderr,
+                      "[HOOK] ERROR: original-image fallback load failed for hash %016llx, "
+                      "error=%d\n",
+                      (unsigned long long)binary.hash, res);
+              abort();
+            }
+            fprintf(stderr,
+                    "[HOOK] INFO: loaded hash %016llx via original-image fallback (device link "
+                    "unavailable)\n",
+                    (unsigned long long)binary.hash);
           }
         } else {
           // Regular single binary (or pre-linked cubin from SAVE mode)

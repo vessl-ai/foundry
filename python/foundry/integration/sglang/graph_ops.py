@@ -394,3 +394,56 @@ def load_all_graphs(cuda_graph_runner) -> None:
     for i, (_index, _filename, meta) in enumerate(graph_files):
         graph, tensors = results[i]
         state.loaded_graphs[meta["key"]] = (graph, _unpack_output(tensors))
+
+
+def load_all_graphs_v3(backend, shape_keys) -> None:
+    """v3 (runner_backend era) LOAD: restore archived graphs into a
+    FullCudaGraphBackend's ``_graphs``/``_outputs`` maps.
+
+    ``shape_keys`` is the ordered list of ShapeKey objects the (neutered)
+    capture loop visited; every archived graph must map onto one of them by
+    ``size``. NVSHMEM module init and threaded template builds reuse the
+    same machinery as the v2 path.
+    """
+    cfg = get_config()
+    state = get_state()
+    if cfg is None or state is None or cfg.workspace_dir is None:
+        raise RuntimeError("Foundry SGLang graph extension is not initialized")
+
+    graph_files = _scan_graph_files(cfg.workspace_dir)
+    if not graph_files:
+        raise RuntimeError(f"No Foundry SGLang graph files found in {cfg.workspace_dir}")
+
+    by_size = {}
+    for key in shape_keys:
+        by_size[int(key.size)] = key
+    archived_sizes = [meta["key"] for _, _, meta in graph_files]
+    missing = [s for s in archived_sizes if s not in by_size]
+    extra = [s for s in by_size if s not in set(archived_sizes)]
+    if missing or extra:
+        raise RuntimeError(
+            "[Foundry] archive/capture shape mismatch — archived sizes "
+            f"missing from capture loop: {missing}; capture sizes with no "
+            f"archived graph: {extra}"
+        )
+
+    cge.init_nvshmem_for_loaded_modules()
+
+    paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
+    t0 = time.perf_counter()
+    pending = FoundryCUDAGraph.start_graph_builds(
+        paths, num_threads=int(os.environ.get("FOUNDRY_GRAPH_LOAD_THREADS", "4"))
+    )
+    results = FoundryCUDAGraph.finish_graph_loads(pending)
+    logger.info(
+        "[Foundry] Loaded %d SGLang graphs in %.3fs (v3)",
+        len(results),
+        time.perf_counter() - t0,
+    )
+
+    for i, (_index, _filename, meta) in enumerate(graph_files):
+        graph, tensors = results[i]
+        shape_key = by_size[meta["key"]]
+        backend._graphs[shape_key] = graph
+        backend._outputs[shape_key] = _unpack_output(tensors)
+        state.loaded_graphs[meta["key"]] = (graph, backend._outputs[shape_key])

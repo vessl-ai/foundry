@@ -90,8 +90,22 @@ def collect_server_args_overrides(server_args) -> dict:
 
 
 def apply_server_args_overrides(server_args, overrides: dict) -> None:
+    if server_args is None:
+        return
     for key, val in (overrides or {}).items():
-        setattr(server_args, key, val)
+        if getattr(server_args, key, None) == val:
+            continue  # already resolved to the same value (frozen forks)
+        try:
+            setattr(server_args, key, val)
+        except AttributeError:
+            try:
+                from sglang.srt.server_args import get_context
+
+                get_context().override("foundry", **{key: val})
+            except Exception:
+                logger.warning(
+                    "[Foundry] cannot override %s on frozen server_args", key
+                )
 
 
 def create_warmup_state(
