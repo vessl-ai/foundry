@@ -60,8 +60,18 @@ def bake(root, sa=SA, complete=True, fingerprint=True, world=2):
             (d / "final_alloc_offset.json").write_text('{"final_alloc_offset": 146255380480}')
 
 def decide(sa=SA):
+    # each call stands for a fresh launch: the inherited-decision env var is
+    # what keeps ranks of ONE launch in agreement, not launches from each other
+    os.environ.pop(rt._AUTO_RESOLVED_ENV, None)
     cfgmod._config.mode = M.AUTO
-    return rt.resolve_auto_mode(sa), rt._auto_decision(sa)[1]
+    mode = rt.resolve_auto_mode(sa)
+    cfgmod._config.mode = M.AUTO
+    return mode, rt._auto_decision(sa)[1]
+
+def decide_inherited(sa=SA):
+    """A worker rank in the same launch must adopt the parent's decision."""
+    cfgmod._config.mode = M.AUTO
+    return rt.resolve_auto_mode(sa)
 
 results = []
 with tempfile.TemporaryDirectory() as tmp:
@@ -94,7 +104,14 @@ with tempfile.TemporaryDirectory() as tmp:
     (root / "warmup_state.json").write_text("{ broken")
     results.append(("손상된 warmup_state", *decide()))
 
-expected = ["save", "load", "save", "save", "save", "save", "save"]
+    # 8. 부모가 load로 결정했으면 워커는 디스크를 다시 보지 않고 그대로 따른다
+    (root / "warmup_state.json").unlink(missing_ok=True)   # 디스크는 비었지만
+    os.environ[rt._AUTO_RESOLVED_ENV] = "load"             # 부모 결정은 load
+    inherited = decide_inherited().value
+    os.environ.pop(rt._AUTO_RESOLVED_ENV, None)
+    results.append(("워커: 부모 결정 상속", type("M", (), {"value": inherited})(), f"inherited={inherited}"))
+
+expected = ["save", "load", "save", "save", "save", "save", "save", "load"]
 print(f"{'케이스':<24} {'결정':<6} 이유")
 print("-" * 96)
 ok = True

@@ -217,11 +217,30 @@ def _auto_decision(server_args) -> tuple[CUDAGraphExtensionMode, str]:
     return CUDAGraphExtensionMode.LOAD, f"complete matching archive ({state.timestamp})"
 
 
+_AUTO_RESOLVED_ENV = "FOUNDRY_AUTO_RESOLVED"
+
+
 def resolve_auto_mode(server_args) -> CUDAGraphExtensionMode:
-    """Turn AUTO into SAVE or LOAD before any hook consults the mode."""
+    """Turn AUTO into SAVE or LOAD.
+
+    Call this only where ``server_args`` is fully resolved: the fingerprint
+    covers derived fields (attention backend, CUDA-graph shapes) that are
+    still unset while ``ServerArgs.__post_init__`` is running, and a decision
+    taken there would never match one taken at save time.
+
+    The first process to decide exports the result, so every rank in the tree
+    agrees — the parent probes the archive before any rank has written to it,
+    and workers must not re-probe a half-written one.
+    """
     cfg = get_config()
     if cfg is None or cfg.mode != CUDAGraphExtensionMode.AUTO:
         return None if cfg is None else cfg.mode
+
+    inherited = os.environ.get(_AUTO_RESOLVED_ENV)
+    if inherited in (CUDAGraphExtensionMode.SAVE.value, CUDAGraphExtensionMode.LOAD.value):
+        cfg.mode = CUDAGraphExtensionMode(inherited)
+        logger.info("[Foundry] auto mode inherited from parent: %s", inherited)
+        return cfg.mode
 
     try:
         decision, reason = _auto_decision(server_args)
@@ -229,6 +248,7 @@ def resolve_auto_mode(server_args) -> CUDAGraphExtensionMode:
         decision, reason = CUDAGraphExtensionMode.SAVE, f"probe failed ({exc})"
 
     cfg.mode = decision
+    os.environ[_AUTO_RESOLVED_ENV] = decision.value
     logger.info("[Foundry] auto mode resolved to %s — %s", decision.value, reason)
     return decision
 
@@ -289,6 +309,9 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
     cfg = get_config()
     if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
         return
+    # server_args is fully resolved by now; safe to decide AUTO here for runs
+    # whose spawn sites the integration did not patch.
+    resolve_auto_mode(server_args)
 
     t0 = time.perf_counter()
     rank = compute_workspace_rank(server_args, tp_rank, pp_rank, dp_rank)

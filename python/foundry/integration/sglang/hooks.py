@@ -103,9 +103,10 @@ def install_hooks(server_args) -> None:
         )
 
     load_graph_extension_config(cfg_path)
-    # AUTO picks SAVE or LOAD from what is on disk; do it before any hook
-    # reads the mode so the rest of the integration sees a concrete one.
-    rt.resolve_auto_mode(server_args)
+    # AUTO is deliberately NOT resolved here: in the parent this runs from
+    # ServerArgs.__post_init__, before the resolution pipeline fills in the
+    # derived fields the fingerprint covers. It is resolved at the spawn sites
+    # and in setup_graph_extension, where server_args is complete.
     logger.info(
         "[Foundry] SGLang hooks installing: mode=%s workspace=%s",
         get_graph_extension_mode().value,
@@ -895,6 +896,18 @@ def _patch_cuda_graph_capture() -> None:
 
 
 def _patch_spawn_sites() -> None:
+    def _prepare_env(owner) -> None:
+        """Resolve AUTO and export LD_PRELOAD/FOUNDRY_MODE for the children.
+
+        server_args is fully resolved by spawn time, and the hook library
+        reads FOUNDRY_MODE in its constructor — before any Python runs in the
+        child — so the mode has to be concrete before the fork.
+        """
+        if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
+            return
+        rt.resolve_auto_mode(getattr(owner, "server_args", None) or _current_server_args())
+        rt.setup_ld_preload_env()
+
     try:
         from sglang.srt.entrypoints import engine as engine_mod
     except Exception:
@@ -905,8 +918,7 @@ def _patch_spawn_sites() -> None:
 
         @functools.wraps(orig_launch)
         def patched_launch(self, *args, **kwargs):
-            if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
-                rt.setup_ld_preload_env()
+            _prepare_env(self)
             return orig_launch(self, *args, **kwargs)
 
         engine_mod.Engine._launch_scheduler_processes = patched_launch
@@ -921,8 +933,7 @@ def _patch_spawn_sites() -> None:
 
         @functools.wraps(orig_start)
         def patched_start(self, *args, **kwargs):
-            if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
-                rt.setup_ld_preload_env()
+            _prepare_env(self)
             return orig_start(self, *args, **kwargs)
 
         dpc.DataParallelController.launch_tensor_parallel_group = patched_start
