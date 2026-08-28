@@ -2147,17 +2147,31 @@ CUresult cuLibraryLoadData(CUlibrary* library, const void* code, CUjit_option* j
       std::vector<std::string> names;
       if (pending_sizes_known.load()) {
         const size_t img_size = probe_image_size(code);
+        std::vector<uint64_t> candidates;
         pending_catalog_size.visit_all([&](const auto& kv) {
-          if (kv.second == img_size) h = kv.first;
+          if (kv.second == img_size) candidates.push_back(kv.first);
         });
-        if (h == 0) return skip_res;
-        pending_kernel_catalog.cvisit(h, [&](const auto& kv) { names = kv.second; });
+        if (candidates.empty()) return skip_res;
+
         typedef CUresult (*cuLibraryGetKernelCount_t)(unsigned int*, CUlibrary);
         auto count_func = (cuLibraryGetKernelCount_t)CUDA_DRIVER_CALL(
             cuda_driver_entry_table, CUDA_ENTRY_cuLibraryGetKernelCount);
         unsigned int kernel_count = 0;
-        matched = count_func && count_func(&kernel_count, *library) == CUDA_SUCCESS &&
-                  kernel_count == names.size();
+        if (!count_func || count_func(&kernel_count, *library) != CUDA_SUCCESS) return skip_res;
+
+        // Two deferred modules can share an image size; the kernel count is
+        // what separates them, so try every size match rather than the last.
+        for (uint64_t candidate : candidates) {
+          std::vector<std::string> candidate_names;
+          pending_kernel_catalog.cvisit(candidate,
+                                        [&](const auto& kv) { candidate_names = kv.second; });
+          if (kernel_count == candidate_names.size()) {
+            h = candidate;
+            names = std::move(candidate_names);
+            matched = true;
+            break;
+          }
+        }
         if (!matched) return skip_res;
       } else {
         // Archive did not record image sizes (older archive): fall back to
