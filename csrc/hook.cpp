@@ -195,6 +195,13 @@ static boost::unordered::concurrent_flat_map<uint64_t, BinaryMetadata> binary_ha
 static boost::unordered::concurrent_flat_map<uint64_t, std::vector<std::string>>
     pending_kernel_catalog;
 static std::atomic<bool> has_pending_catalog{false};
+// Image size of each deferred module, so the runtime-load probe can reject
+// non-candidates with an O(header) size check instead of a full-image CRC.
+// Measured cost of hashing every image instead: 6 GB / 13.7 s per rank.
+static boost::unordered::concurrent_flat_map<uint64_t, size_t> pending_catalog_size;
+// Cleared if any deferral arrives without a known size, which disables the
+// pre-filter rather than risk never matching the real library.
+static std::atomic<bool> pending_sizes_known{true};
 
 struct VariantHash {
   std::size_t operator()(const std::variant<CUmodule, CUlibrary>& v) const {
@@ -355,12 +362,29 @@ static size_t get_allocation_granularity(CUdevice device) {
   return granularity;
 }
 
-static uint64_t compute_hash(const std::vector<uint8_t>& data) {
+static uint64_t compute_hash(const uint8_t* data, size_t size) {
   boost::crc_optimal<64, 0x42F0E1EBA9EA3693ULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, true,
                      true>
       crc;
-  crc.process_bytes(data.data(), data.size());
+  crc.process_bytes(data, size);
   return crc.checksum();
+}
+
+static uint64_t compute_hash(const std::vector<uint8_t>& data) {
+  return compute_hash(data.data(), data.size());
+}
+
+// Cost accounting for the LOAD-mode probe path, which hashes every library
+// image the runtime loads while a kernel catalog is still pending.
+static std::atomic<uint64_t> probe_calls{0};
+static std::atomic<uint64_t> probe_bytes{0};
+static std::atomic<uint64_t> probe_ns{0};
+
+static void report_probe_cost(const char* where) {
+  const uint64_t calls = probe_calls.load();
+  if (calls == 0) return;
+  fprintf(stderr, "[HOOK] PROBE-COST (%s): %llu images, %.1f MB hashed, %.2f s\n", where,
+          (unsigned long long)calls, probe_bytes.load() / 1048576.0, probe_ns.load() / 1e9);
 }
 
 static BinaryFormat detect_binary_format(const void* data_ptr) {
@@ -601,11 +625,15 @@ static std::string library_option_value_to_string(CUlibraryOption opt, void* val
 // Compute the same content hash dump_fatbin_and_info would produce for an
 // image, without recording any metadata. Used to match runtime library loads
 // against pending (deferred) kernel catalogs in LOAD mode.
-static uint64_t probe_image_hash(const void* data_ptr) {
+// Resolve the fatbin payload of a library image without copying it. `owned`
+// only becomes non-empty for multi-fatbin wrappers, which must be
+// concatenated to hash as one blob.
+static const uint8_t* resolve_image(const void* data_ptr, size_t* out_size,
+                                    std::vector<uint8_t>& owned) {
   const BinaryFormat format = detect_binary_format(data_ptr);
   const uint8_t* binary_data = nullptr;
   size_t total_size = 0;
-  std::vector<uint8_t> concatenated;
+  std::vector<uint8_t>& concatenated = owned;
   if (format == BinaryFormat::WRAPPER) {
     const auto* wrapper = static_cast<const __fatBinC_Wrapper_t*>(data_ptr);
     if (wrapper->version == FATBINC_VERSION) {
@@ -613,7 +641,7 @@ static uint64_t probe_image_hash(const void* data_ptr) {
       total_size = compute_fatbin_size(binary_data);
     } else if (wrapper->version == FATBINC_LINK_VERSION) {
       auto** fatbin_array = static_cast<void**>(wrapper->filename_or_fatbins);
-      if (!fatbin_array || !fatbin_array[0]) return 0;
+      if (!fatbin_array || !fatbin_array[0]) return nullptr;
       size_t num_fatbins = 0;
       for (void** ptr = fatbin_array; *ptr != nullptr; ptr++) num_fatbins++;
       if (num_fatbins == 1) {
@@ -629,15 +657,38 @@ static uint64_t probe_image_hash(const void* data_ptr) {
         total_size = concatenated.size();
       }
     } else {
-      return 0;
+      return nullptr;
     }
   } else {
     binary_data = static_cast<const uint8_t*>(data_ptr);
     total_size = compute_fatbin_size(binary_data);
   }
-  if (!binary_data || total_size == 0) return 0;
-  std::vector<uint8_t> vec(binary_data, binary_data + total_size);
-  return compute_hash(vec);
+  if (!binary_data || total_size == 0) return nullptr;
+  *out_size = total_size;
+  return binary_data;
+}
+
+static size_t probe_image_size(const void* data_ptr) {
+  size_t size = 0;
+  std::vector<uint8_t> owned;
+  return resolve_image(data_ptr, &size, owned) ? size : 0;
+}
+
+static uint64_t probe_image_hash(const void* data_ptr) {
+  size_t total_size = 0;
+  std::vector<uint8_t> owned;
+  const uint8_t* binary_data = resolve_image(data_ptr, &total_size, owned);
+  if (!binary_data) return 0;
+  // Hash straight from the loaded image: copying it into a vector first cost a
+  // full memcpy of every library the runtime loads.
+  const auto t0 = std::chrono::steady_clock::now();
+  const uint64_t h = compute_hash(binary_data, total_size);
+  probe_calls.fetch_add(1);
+  probe_bytes.fetch_add(total_size);
+  probe_ns.fetch_add(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+          .count());
+  return h;
 }
 
 static void dump_fatbin_and_info(const void* data_ptr, std::string_view func_name,
@@ -1514,7 +1565,8 @@ static void setup_handles_for_module(CUmodule module, uint64_t hash,
 
 static void setup_handles_for_library(CUlibrary library, uint64_t hash,
                                       const std::vector<std::string>& expected_names,
-                                      bool requires_nvshmem = false) {
+                                      bool requires_nvshmem = false,
+                                      size_t archived_image_size = 0) {
   typedef CUresult (*cuLibraryGetKernelCount_t)(unsigned int*, CUlibrary);
   typedef CUresult (*cuLibraryEnumerateKernels_t)(CUkernel*, unsigned int, CUlibrary);
   typedef CUresult (*cuKernelGetName_t)(const char**, CUkernel);
@@ -1540,6 +1592,11 @@ static void setup_handles_for_library(CUlibrary library, uint64_t hash,
             (unsigned long long)hash, kernel_count, expected_names.size());
     pending_kernel_catalog.insert_or_assign(
         hash, std::vector<std::string>(expected_names.begin(), expected_names.end()));
+    if (archived_image_size != 0) {
+      pending_catalog_size.insert_or_assign(hash, archived_image_size);
+    } else {
+      pending_sizes_known.store(false);
+    }
     has_pending_catalog.store(true);
     return;
   }
@@ -1937,6 +1994,12 @@ static void __attribute__((constructor)) init_hook() {
 }
 
 static void __attribute__((destructor)) cleanup_hook() {
+  report_probe_cost("process exit");
+  if (has_pending_catalog.load()) {
+    fprintf(stderr,
+            "[HOOK] WARNING: %zu deferred kernel catalog(s) never matched a runtime library load\n",
+            pending_kernel_catalog.size());
+  }
   pack_fatbins_on_exit();
 }
 
@@ -2074,14 +2137,38 @@ CUresult cuLibraryLoadData(CUlibrary* library, const void* code, CUjit_option* j
     CUresult skip_res = real_func(library, code, jitOptions, jitOptionsValues, numJitOptions,
                                   libraryOptions, libraryOptionValues, numLibraryOptions);
     if (skip_res == CUDA_SUCCESS && library && *library && has_pending_catalog.load()) {
-      const uint64_t h = probe_image_hash(code);
+      // Identify the library by size and kernel count rather than by hashing
+      // its image: the deferred module here is NCCL's device-kernel fatbin,
+      // 5.7 GB of it, and CRC-ing that on every launch cost 13 s per rank.
+      // Size comes from the archive, and the kernel count/name list is what
+      // the catalog is keyed on anyway, so the match stays exact.
+      uint64_t h = 0;
       bool matched = false;
       std::vector<std::string> names;
-      if (h != 0) {
-        pending_kernel_catalog.cvisit(h, [&](const auto& kv) {
-          matched = true;
-          names = kv.second;
+      if (pending_sizes_known.load()) {
+        const size_t img_size = probe_image_size(code);
+        pending_catalog_size.visit_all([&](const auto& kv) {
+          if (kv.second == img_size) h = kv.first;
         });
+        if (h == 0) return skip_res;
+        pending_kernel_catalog.cvisit(h, [&](const auto& kv) { names = kv.second; });
+        typedef CUresult (*cuLibraryGetKernelCount_t)(unsigned int*, CUlibrary);
+        auto count_func = (cuLibraryGetKernelCount_t)CUDA_DRIVER_CALL(
+            cuda_driver_entry_table, CUDA_ENTRY_cuLibraryGetKernelCount);
+        unsigned int kernel_count = 0;
+        matched = count_func && count_func(&kernel_count, *library) == CUDA_SUCCESS &&
+                  kernel_count == names.size();
+        if (!matched) return skip_res;
+      } else {
+        // Archive did not record image sizes (older archive): fall back to
+        // hashing, which is correct but pays the full CRC.
+        h = probe_image_hash(code);
+        if (h != 0) {
+          pending_kernel_catalog.cvisit(h, [&](const auto& kv) {
+            matched = true;
+            names = kv.second;
+          });
+        }
       }
       if (matched) {
         fprintf(stderr,
@@ -2090,7 +2177,10 @@ CUresult cuLibraryLoadData(CUlibrary* library, const void* code, CUjit_option* j
                 (unsigned long long)h);
         setup_handles_for_library(*library, h, names, false);
         pending_kernel_catalog.erase(h);
-        if (pending_kernel_catalog.empty()) has_pending_catalog.store(false);
+        if (pending_kernel_catalog.empty()) {
+          has_pending_catalog.store(false);
+          report_probe_cost("catalog resolved");
+        }
       }
     }
     return skip_res;
@@ -4291,7 +4381,8 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
           }
         }
         setup_handles_for_library(library, binary.hash, binary.entry_names,
-                                  binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM);
+                                  binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM,
+                                  binary.data.size());
       } else if (binary.options.base_func_name == "cuModuleLoadDataEx") {
         CUmodule module = nullptr;
         CUjit_option* jit_opts =
@@ -4402,7 +4493,8 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
           abort();
         }
         setup_handles_for_library(library, binary.hash, binary.entry_names,
-                                  binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM);
+                                  binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM,
+                                  binary.data.size());
       } else {
         fprintf(stderr, "[HOOK] ERROR: Unknown function name: %s\n",
                 binary.options.base_func_name.c_str());
