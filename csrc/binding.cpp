@@ -34,6 +34,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Resume previously set allocation region for CUDA VMM hooks");
 
   m.def(
+      "report_hook_stats",
+      [](const std::string& where) { ::foundry::report_hook_stats(where.c_str()); },
+      py::arg("where") = "", "Print per-entry-point call counts and time for the hook");
+
+  m.def(
       "set_sync_on_free", [](bool enabled) { ::foundry::set_sync_on_free(enabled); },
       py::arg("enabled"),
       "Toggle the device synchronize performed before unmapping freed VMM "

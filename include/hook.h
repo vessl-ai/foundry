@@ -28,6 +28,7 @@ void set_allocation_region(void* base, size_t size);
 void stop_allocation_region();
 void resume_allocation_region();
 void set_sync_on_free(bool enabled);
+void report_hook_stats(const char* where);
 bool preallocate_region(size_t size);
 void free_preallocated_region();
 size_t get_current_alloc_offset();

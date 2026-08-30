@@ -11,6 +11,8 @@
 #include <cstring>
 #include <cassert>
 #include <atomic>
+#include <chrono>
+#include <set>
 #include <mutex>
 #include <variant>
 #include <tuple>
@@ -380,6 +382,55 @@ static std::atomic<uint64_t> probe_calls{0};
 static std::atomic<uint64_t> probe_bytes{0};
 static std::atomic<uint64_t> probe_ns{0};
 
+// Per-entry-point accounting for the driver calls foundry interposes, so the
+// startup overhead can be attributed to a call rather than guessed at.
+struct EntryStat {
+  std::atomic<uint64_t> calls{0};
+  std::atomic<uint64_t> ns{0};
+  const char* name;
+};
+static EntryStat stat_mem_alloc{{0}, {0}, "cuMemAlloc"};
+static EntryStat stat_mem_create{{0}, {0}, "cuMemCreate"};
+static EntryStat stat_mem_map{{0}, {0}, "cuMemMap"};
+static EntryStat stat_mem_set_access{{0}, {0}, "cuMemSetAccess"};
+static EntryStat stat_addr_reserve{{0}, {0}, "cuMemAddressReserve"};
+static EntryStat stat_mem_free{{0}, {0}, "cuMemFree"};
+static EntryStat stat_lib_load{{0}, {0}, "cuLibraryLoadData"};
+static EntryStat stat_mod_load{{0}, {0}, "cuModuleLoadData"};
+static EntryStat stat_lib_driver{{0}, {0}, "  ├─driver_load"};
+static EntryStat stat_lib_probe{{0}, {0}, "  └─our_probe"};
+
+struct ScopedStat {
+  EntryStat& s;
+  std::chrono::steady_clock::time_point t0;
+  explicit ScopedStat(EntryStat& st) : s(st), t0(std::chrono::steady_clock::now()) {}
+  ~ScopedStat() {
+    s.calls.fetch_add(1);
+    s.ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count());
+  }
+};
+#define FOUNDRY_STAT(st) ScopedStat _foundry_stat_guard(st)
+
+static EntryStat* const all_entry_stats[] = {
+    &stat_mem_alloc,     &stat_mem_create, &stat_mem_map, &stat_mem_set_access,
+    &stat_addr_reserve,  &stat_mem_free,   &stat_lib_load, &stat_mod_load,
+    &stat_lib_driver,    &stat_lib_probe};
+
+static void report_hook_stats_impl(const char* where) {
+  fprintf(stderr, "[HOOK] ENTRY-STATS (%s):", where ? where : "");
+  bool any = false;
+  for (EntryStat* st : all_entry_stats) {
+    const uint64_t c = st->calls.load();
+    if (c == 0) continue;
+    any = true;
+    fprintf(stderr, " %s=%llux/%.2fs", st->name, (unsigned long long)c, st->ns.load() / 1e9);
+  }
+  if (!any) fprintf(stderr, " (none)");
+  fprintf(stderr, "\n");
+}
+
 static void report_probe_cost(const char* where) {
   const uint64_t calls = probe_calls.load();
   if (calls == 0) return;
@@ -666,12 +717,6 @@ static const uint8_t* resolve_image(const void* data_ptr, size_t* out_size,
   if (!binary_data || total_size == 0) return nullptr;
   *out_size = total_size;
   return binary_data;
-}
-
-static size_t probe_image_size(const void* data_ptr) {
-  size_t size = 0;
-  std::vector<uint8_t> owned;
-  return resolve_image(data_ptr, &size, owned) ? size : 0;
 }
 
 static uint64_t probe_image_hash(const void* data_ptr) {
@@ -2006,6 +2051,7 @@ static void __attribute__((destructor)) cleanup_hook() {
 extern "C" {
 
 CUresult cuModuleLoadData(CUmodule* module, const void* image) {
+  FOUNDRY_STAT(stat_mod_load);
 #ifdef HOOK_DEBUG
   fprintf(stderr, "[HOOK] cuModuleLoadData\n");
 #endif
@@ -2044,6 +2090,7 @@ CUresult cuModuleLoadData(CUmodule* module, const void* image) {
 
 CUresult cuModuleLoadDataEx(CUmodule* module, const void* image, unsigned int numOptions,
                             CUjit_option* options, void** optionValues) {
+  FOUNDRY_STAT(stat_mod_load);
 #ifdef HOOK_DEBUG
   fprintf(stderr, "[HOOK] cuModuleLoadDataEx\n");
 #endif
@@ -2122,6 +2169,7 @@ CUresult cuLibraryLoadData(CUlibrary* library, const void* code, CUjit_option* j
                            void** jitOptionsValues, unsigned int numJitOptions,
                            CUlibraryOption* libraryOptions, void** libraryOptionValues,
                            unsigned int numLibraryOptions) {
+  FOUNDRY_STAT(stat_lib_load);
 #ifdef HOOK_DEBUG
   fprintf(stderr, "[HOOK] cuLibraryLoadData\n");
 #endif
@@ -2134,38 +2182,64 @@ CUresult cuLibraryLoadData(CUlibrary* library, const void* code, CUjit_option* j
   // Skip heavy processing in LOAD mode for faster startup — but still match
   // runtime loads against deferred kernel catalogs (see pending_kernel_catalog).
   if (skip_fatbin_processing.load()) {
-    CUresult skip_res = real_func(library, code, jitOptions, jitOptionsValues, numJitOptions,
-                                  libraryOptions, libraryOptionValues, numLibraryOptions);
+    CUresult skip_res;
+    {
+      FOUNDRY_STAT(stat_lib_driver);
+      skip_res = real_func(library, code, jitOptions, jitOptionsValues, numJitOptions,
+                           libraryOptions, libraryOptionValues, numLibraryOptions);
+    }
+    FOUNDRY_STAT(stat_lib_probe);
     if (skip_res == CUDA_SUCCESS && library && *library && has_pending_catalog.load()) {
-      // Identify the library by size and kernel count rather than by hashing
-      // its image: the deferred module here is NCCL's device-kernel fatbin,
-      // 5.7 GB of it, and CRC-ing that on every launch cost 13 s per rank.
-      // Size comes from the archive, and the kernel count/name list is what
-      // the catalog is keyed on anyway, so the match stays exact.
+      // Identify the library without touching its image at all. Both earlier
+      // attempts read it: a full CRC (6.1 GB / 13.7 s) and then a fatbin
+      // header walk for the size (9.9 s of page faults on a 5.7 GB NCCL
+      // image). The kernel count and names come from the driver for the
+      // already-loaded library, so they cost nothing and identify it exactly.
       uint64_t h = 0;
       bool matched = false;
       std::vector<std::string> names;
-      if (pending_sizes_known.load()) {
-        const size_t img_size = probe_image_size(code);
+      {
+        typedef CUresult (*cuLibraryGetKernelCount_t)(unsigned int*, CUlibrary);
+        typedef CUresult (*cuLibraryEnumerateKernels_t)(CUkernel*, unsigned int, CUlibrary);
+        typedef CUresult (*cuKernelGetName_t)(const char**, CUkernel);
+        auto count_func = (cuLibraryGetKernelCount_t)CUDA_DRIVER_CALL(
+            cuda_driver_entry_table, CUDA_ENTRY_cuLibraryGetKernelCount);
+        auto enum_func = (cuLibraryEnumerateKernels_t)CUDA_DRIVER_CALL(
+            cuda_driver_entry_table, CUDA_ENTRY_cuLibraryEnumerateKernels);
+        auto name_func = (cuKernelGetName_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
+                                                             CUDA_ENTRY_cuKernelGetName);
+        unsigned int kernel_count = 0;
+        if (!count_func || count_func(&kernel_count, *library) != CUDA_SUCCESS ||
+            kernel_count == 0) {
+          return skip_res;
+        }
+
         std::vector<uint64_t> candidates;
-        pending_catalog_size.visit_all([&](const auto& kv) {
-          if (kv.second == img_size) candidates.push_back(kv.first);
+        pending_kernel_catalog.visit_all([&](const auto& kv) {
+          if (kv.second.size() == kernel_count) candidates.push_back(kv.first);
         });
         if (candidates.empty()) return skip_res;
 
-        typedef CUresult (*cuLibraryGetKernelCount_t)(unsigned int*, CUlibrary);
-        auto count_func = (cuLibraryGetKernelCount_t)CUDA_DRIVER_CALL(
-            cuda_driver_entry_table, CUDA_ENTRY_cuLibraryGetKernelCount);
-        unsigned int kernel_count = 0;
-        if (!count_func || count_func(&kernel_count, *library) != CUDA_SUCCESS) return skip_res;
+        // Confirm by name set, so a same-sized unrelated library cannot be
+        // mistaken for the deferred one.
+        std::set<std::string> loaded_names;
+        if (enum_func && name_func) {
+          std::vector<CUkernel> kernels(kernel_count);
+          if (enum_func(kernels.data(), kernel_count, *library) == CUDA_SUCCESS) {
+            for (CUkernel k : kernels) {
+              const char* n = nullptr;
+              if (name_func(&n, k) == CUDA_SUCCESS && n) loaded_names.insert(n);
+            }
+          }
+        }
+        if (loaded_names.empty()) return skip_res;
 
-        // Two deferred modules can share an image size; the kernel count is
-        // what separates them, so try every size match rather than the last.
         for (uint64_t candidate : candidates) {
           std::vector<std::string> candidate_names;
           pending_kernel_catalog.cvisit(candidate,
                                         [&](const auto& kv) { candidate_names = kv.second; });
-          if (kernel_count == candidate_names.size()) {
+          std::set<std::string> expected(candidate_names.begin(), candidate_names.end());
+          if (expected == loaded_names) {
             h = candidate;
             names = std::move(candidate_names);
             matched = true;
@@ -2173,17 +2247,8 @@ CUresult cuLibraryLoadData(CUlibrary* library, const void* code, CUjit_option* j
           }
         }
         if (!matched) return skip_res;
-      } else {
-        // Archive did not record image sizes (older archive): fall back to
-        // hashing, which is correct but pays the full CRC.
-        h = probe_image_hash(code);
-        if (h != 0) {
-          pending_kernel_catalog.cvisit(h, [&](const auto& kv) {
-            matched = true;
-            names = kv.second;
-          });
-        }
       }
+
       if (matched) {
         fprintf(stderr,
                 "[HOOK] INFO: resolving deferred kernel catalog for hash %016llx from runtime "
@@ -2485,6 +2550,7 @@ CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion, cu
 }
 
 CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
+  FOUNDRY_STAT(stat_mem_alloc);
   FOUNDRY_ALLOC_LOCK();
   typedef CUresult (*cuMemAlloc_t)(CUdeviceptr*, size_t);
   auto real_func =
@@ -2872,6 +2938,7 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInByt
 }
 
 CUresult cuMemFree_v2(CUdeviceptr dptr) {
+  FOUNDRY_STAT(stat_mem_free);
   FOUNDRY_ALLOC_LOCK();
   typedef CUresult (*cuMemFree_t)(CUdeviceptr);
   auto real_func = (cuMemFree_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemFree_v2);
@@ -2945,6 +3012,7 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
 
 CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CUdeviceptr addr,
                              unsigned long long flags) {
+  FOUNDRY_STAT(stat_addr_reserve);
   FOUNDRY_ALLOC_LOCK();
   typedef CUresult (*cuMemAddressReserve_t)(CUdeviceptr*, size_t, size_t, CUdeviceptr,
                                             unsigned long long);
@@ -3437,6 +3505,8 @@ void stop_allocation_region() {
 }
 
 void set_sync_on_free(bool enabled) { g_sync_on_free.store(enabled); }
+
+void report_hook_stats(const char* where) { report_hook_stats_impl(where); }
 
 void resume_allocation_region() {
   FOUNDRY_ALLOC_LOCK();

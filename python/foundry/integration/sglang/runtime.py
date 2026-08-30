@@ -403,6 +403,16 @@ def disable_sync_on_free() -> None:
         setter(False)
 
 
+def log_hook_stats(label: str) -> None:
+    """Dump the hook's per-entry-point call counts and time at a phase edge."""
+    fn = getattr(cge, "report_hook_stats", None)
+    if fn is not None:
+        try:
+            fn(label)
+        except Exception:
+            pass
+
+
 def log_alloc_offset(label: str) -> None:
     cfg = get_config()
     if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
@@ -414,6 +424,7 @@ def log_alloc_offset(label: str) -> None:
         offset,
         offset / (1024 * 1024),
     )
+    log_hook_stats(label)
 
 
 def setup_ld_preload_env() -> None:
