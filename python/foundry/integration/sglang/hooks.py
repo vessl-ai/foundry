@@ -126,6 +126,16 @@ def install_hooks(server_args) -> None:
         _patch_load_model()
         _patch_kernel_warmup()
         _patch_cuda_graph_capture()
+    if os.environ.get("FOUNDRY_BCG_PROBE") == "1":
+        _patch_bcg_probe()
+    if os.environ.get("FOUNDRY_BCG_CACHE") == "1":
+        from foundry.integration.sglang.bcg_ops import (
+            install_bcg_load_hooks,
+            install_bcg_save_hooks,
+        )
+
+        install_bcg_save_hooks()
+        install_bcg_load_hooks()
     _patch_spawn_sites()
 
     _INSTALLED = True
@@ -320,6 +330,72 @@ def _patch_cuda_graph_capture_v3() -> None:
 
     backend_cls.capture_one = patched_capture_one
     runner_cls.capture = patched_capture
+
+
+
+def _patch_bcg_probe() -> None:
+    """Time the three forwards BCG capture runs per shape.
+
+    capture_one warms up twice and then captures once, all through the same
+    forward_fn. Timing the calls separately says how much of prefill capture
+    is stream capture (the part an archive could replace) versus plain
+    forwards (the part a restore would still have to pay).
+    Enabled with FOUNDRY_BCG_PROBE=1; off by default.
+    """
+    try:
+        from sglang.srt.model_executor.runner_backend import (
+            breakable_cuda_graph_backend as bcg,
+        )
+    except Exception:
+        logger.warning("[Foundry] BCG probe: backend module not found")
+        return
+
+    cls = bcg.BreakableCudaGraphBackend
+    orig = cls.capture_one
+    acc = {"warmup": 0.0, "capture": 0.0, "total": 0.0, "shapes": 0}
+
+    @functools.wraps(orig)
+    def patched(self, shape_key, forward_fn, *args, **kwargs):
+        seen = {"n": 0}
+
+        def timed_forward():
+            t = time.perf_counter()
+            out = forward_fn()
+            dt = time.perf_counter() - t
+            seen["n"] += 1
+            acc["warmup" if seen["n"] <= 2 else "capture"] += dt
+            return out
+
+        t0 = time.perf_counter()
+        result = orig(self, shape_key, timed_forward, *args, **kwargs)
+        acc["total"] += time.perf_counter() - t0
+        acc["shapes"] += 1
+        # Segment/break counts decide how much an archive would have to hold.
+        graph = self._graphs.get(shape_key)
+        segs = len(getattr(graph, "_segments", []) or [])
+        brks = len(getattr(graph, "_break_fns", []) or [])
+        acc["segments"] = acc.get("segments", 0) + segs
+        acc["breaks"] = acc.get("breaks", 0) + brks
+        acc.setdefault("seg_hist", {})[segs] = acc.setdefault("seg_hist", {}).get(segs, 0) + 1
+        if acc["shapes"] % 20 == 0:
+            _log_bcg_probe(acc)
+        return result
+
+    cls.capture_one = patched
+    cls._foundry_bcg_acc = acc
+    logger.info("[Foundry] BCG capture probe installed")
+
+
+def _log_bcg_probe(acc) -> None:
+    n = acc["shapes"] or 1
+    other = acc["total"] - acc["warmup"] - acc["capture"]
+    logger.info(
+        "[Foundry] BCG-PROBE shapes=%d total=%.2fs warmup=%.2fs capture=%.2fs other=%.2fs "
+        "(per shape: warmup=%.3fs capture=%.3fs other=%.3fs) segments=%d breaks=%d hist=%s",
+        acc["shapes"], acc["total"], acc["warmup"], acc["capture"], other,
+        acc["warmup"] / n, acc["capture"] / n, other / n,
+        acc.get("segments", 0), acc.get("breaks", 0), acc.get("seg_hist", {}),
+    )
 
 
 def _runner_parallel_ranks(model_runner):

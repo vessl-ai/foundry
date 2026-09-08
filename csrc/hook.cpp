@@ -399,6 +399,8 @@ static EntryStat stat_lib_load{{0}, {0}, "cuLibraryLoadData"};
 static EntryStat stat_mod_load{{0}, {0}, "cuModuleLoadData"};
 static EntryStat stat_lib_driver{{0}, {0}, "  ├─driver_load"};
 static EntryStat stat_lib_probe{{0}, {0}, "  └─our_probe"};
+static EntryStat stat_dlsym{{0}, {0}, "dlsym"};
+static EntryStat stat_getproc{{0}, {0}, "cuGetProcAddress"};
 
 struct ScopedStat {
   EntryStat& s;
@@ -416,7 +418,7 @@ struct ScopedStat {
 static EntryStat* const all_entry_stats[] = {
     &stat_mem_alloc,     &stat_mem_create, &stat_mem_map, &stat_mem_set_access,
     &stat_addr_reserve,  &stat_mem_free,   &stat_lib_load, &stat_mod_load,
-    &stat_lib_driver,    &stat_lib_probe};
+    &stat_lib_driver,    &stat_lib_probe,  &stat_dlsym,    &stat_getproc};
 
 static void report_hook_stats_impl(const char* where) {
   fprintf(stderr, "[HOOK] ENTRY-STATS (%s):", where ? where : "");
@@ -2040,6 +2042,7 @@ static void __attribute__((constructor)) init_hook() {
 
 static void __attribute__((destructor)) cleanup_hook() {
   report_probe_cost("process exit");
+  report_hook_stats_impl("process exit");
   if (has_pending_catalog.load()) {
     fprintf(stderr,
             "[HOOK] WARNING: %zu deferred kernel catalog(s) never matched a runtime library load\n",
@@ -2514,6 +2517,7 @@ static void* find_symbol_by_cuda_version(const char* symbol, int cudaVersion) {
 }
 
 CUresult cuGetProcAddress(const char* symbol, void** pfn, int cudaVersion, cuuint64_t flags) {
+  FOUNDRY_STAT(stat_getproc);
   typedef CUresult (*cuGetProcAddress_t)(const char*, void**, int, cuuint64_t);
   auto real_func =
       (cuGetProcAddress_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuGetProcAddress);
@@ -2531,6 +2535,7 @@ CUresult cuGetProcAddress(const char* symbol, void** pfn, int cudaVersion, cuuin
 
 CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion, cuuint64_t flags,
                              CUdriverProcAddressQueryResult* symbolStatus) {
+  FOUNDRY_STAT(stat_getproc);
   typedef CUresult (*cuGetProcAddress_v2_t)(const char*, void**, int, cuuint64_t,
                                             CUdriverProcAddressQueryResult*);
   auto real_func = (cuGetProcAddress_v2_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
@@ -3141,6 +3146,7 @@ CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
 }
 
 void* dlsym(void* handle, const char* symbol) {
+  FOUNDRY_STAT(stat_dlsym);
   if (!real_dlsym) {
     get_real_dlsym();
   }

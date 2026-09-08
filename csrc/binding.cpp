@@ -39,6 +39,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("where") = "", "Print per-entry-point call counts and time for the hook");
 
   m.def(
+      "tensor_from_ptr",
+      [](uintptr_t ptr, std::vector<int64_t> sizes, std::vector<int64_t> strides,
+         at::ScalarType dtype, int64_t device_index) {
+        auto options = at::TensorOptions().dtype(dtype).device(at::kCUDA, device_index);
+        return at::from_blob(reinterpret_cast<void*>(ptr), sizes, strides, options);
+      },
+      py::arg("ptr"), py::arg("sizes"), py::arg("strides"), py::arg("dtype"),
+      py::arg("device_index"),
+      "View existing device memory as a tensor (no ownership). For restoring "
+      "graph-referenced tensors at their archived addresses.");
+
+  m.def(
       "set_sync_on_free", [](bool enabled) { ::foundry::set_sync_on_free(enabled); },
       py::arg("enabled"),
       "Toggle the device synchronize performed before unmapping freed VMM "

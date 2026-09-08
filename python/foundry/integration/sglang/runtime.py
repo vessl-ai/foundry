@@ -377,10 +377,21 @@ def capture_final_alloc_offset() -> int:
     return _final_alloc_offset
 
 
+_preallocated = False
+
+
 def preallocate_for_load_mode() -> None:
+    """Map the region up to SAVE's watermark. Idempotent: BCG prefill restore
+    runs before the decode runner and needs the mapping first; the second
+    caller must not tear down and rebuild the preallocation under live
+    tensor views."""
+    global _preallocated
     cfg = get_config()
     if cfg is None or cfg.mode != CUDAGraphExtensionMode.LOAD:
         return
+    if _preallocated:
+        return
+    _preallocated = True
     final = 0
     if cfg.workspace_dir is not None:
         path = os.path.join(cfg.workspace_dir, "final_alloc_offset.json")
