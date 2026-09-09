@@ -1012,6 +1012,15 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
             cluster_depth = v;
         }
 
+        // Clusters larger than the portable limit (8 CTAs) can only launch
+        // when the function opts in via NON_PORTABLE_CLUSTER_SIZE_ALLOWED.
+        // The direct build path sets this too; the on-demand/template path
+        // (used by decode graphs that share a topology group) needs it here
+        // or instantiate later fails with "cluster misconfiguration" — seen
+        // with trtllm-gen sm100 fmha decode kernels (cluster 16x1x1).
+        long total_ctas = (long)std::max(cluster_width, 1) * std::max(cluster_height, 1) *
+                          std::max(cluster_depth, 1);
+
         if (std::holds_alternative<CUkernel>(func_handle_variant)) {
           CUkernel kern = std::get<CUkernel>(func_handle_variant);
           CUdevice dev = parsed.graph->capture_dev_;
@@ -1023,6 +1032,10 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
             C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(
                 CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, preferred_carveout, kern, dev));
           }
+          if (total_ctas > 8) {
+            C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(
+                CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1, kern, dev));
+          }
         } else {
           CUfunction func = std::get<CUfunction>(func_handle_variant);
           if (max_shared > 0) {
@@ -1032,6 +1045,10 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
           if (preferred_carveout >= 0) {
             C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
                 func, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, preferred_carveout));
+          }
+          if (total_ctas > 8) {
+            C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
+                func, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1));
           }
         }
       }
