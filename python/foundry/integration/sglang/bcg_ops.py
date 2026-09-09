@@ -174,6 +174,7 @@ def install_bcg_save_hooks() -> None:
         if graph is not None:
             _check_no_pull_kernels(shape_key.size)
             _record_break_metadata(graph, shape_key.size)
+            _wrap_break_checksums(graph, shape_key.size)
             _record_capture_inputs_metadata(shape_key.size, kwargs.get("capture_inputs") or (args[0] if args else None))
             record_shared_buffer_metadata(self, shape_key, self._outputs.get(shape_key))
         logger.info(
@@ -214,6 +215,7 @@ def install_bcg_save_hooks() -> None:
         _ctx["save_time"] += time.perf_counter() - t0
 
     _raise_allreduce_push_thresholds()
+    _install_param_map_probe()
     backend_cls.capture_one = patched_capture_one
     capture_cls._begin_new_segment = patched_begin
     graph_cls._append_segment = patched_append
@@ -514,6 +516,181 @@ class _CollectOnlyCapture:
         pass
 
 
+def _wrap_break_checksums(graph, size: int) -> None:
+    """FOUNDRY_BCG_SUM=1: print a checksum of each break's first tensor input
+    before running it, on both SAVE and LOAD replay — diffing the two logs
+    pinpoints the first layer whose activations diverge."""
+    if os.environ.get("FOUNDRY_BCG_SUM") != "1":
+        return
+    import json
+
+    meta_path = os.path.join(_workspace_dir(), f"bcg_{size}_meta.json")
+    if not os.path.exists(meta_path):
+        return
+    meta = json.load(open(meta_path))
+    for i, (fn, bmeta) in enumerate(zip(graph._break_fns, meta["breaks"])):
+        tensors = _rebuild_from_meta(bmeta["args"])
+        probe = tensors[0] if tensors else None
+
+        def wrapped(fn=fn, probe=probe, i=i):
+            if probe is not None and (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            ):
+                torch.cuda.synchronize()
+                s = probe.float().abs().sum().item()
+                print(f"[BCG-SUM] size={size} break={i} in={s:.6e}", flush=True)
+            return fn()
+
+        graph._break_fns[i] = wrapped
+
+
+def _ep_dispatcher_map_path() -> str:
+    return os.path.join(_workspace_dir(), "ep_dispatcher_map.json")
+
+
+def _iter_moe_dispatchers(model):
+    for name, module in model.named_modules():
+        disp = getattr(module, "dispatcher", None)
+        if disp is not None and hasattr(disp, "local_expert_mapping"):
+            yield name, disp
+
+
+def _record_ep_dispatcher_maps(model) -> None:
+    """SAVE (after capture): archive the address of each dispatcher's lazily
+    created ``local_expert_mapping`` — captured graphs read it in place."""
+    import json as _json
+
+    import hashlib
+
+    out = {}
+    for name, disp in _iter_moe_dispatchers(model):
+        t = disp.local_expert_mapping
+        if t is not None:
+            digest = hashlib.sha1(
+                t.detach().contiguous().cpu().numpy().tobytes()
+            ).hexdigest()[:16]
+            out[name] = {"ptr": t.data_ptr(), "numel": t.numel(), "hash": digest}
+    if out:
+        with open(_ep_dispatcher_map_path(), "w") as f:
+            _json.dump(out, f)
+        logger.info("[Foundry] EP dispatcher maps recorded (%d layers)", len(out))
+
+
+def _restore_ep_dispatcher_maps(model) -> None:
+    """LOAD (before replay): the mapping is lazily built during warmup, which
+    LOAD skips entirely — the captured graphs would read unwritten memory and
+    silently route every token to the wrong expert.  Rebuild the mapping at
+    the archived address and hand it to the dispatcher."""
+    import json as _json
+
+    from foundry import ops as foundry_ops
+    from foundry.integration.sglang import runtime as rt
+
+    path = _ep_dispatcher_map_path()
+    if not os.path.exists(path):
+        return
+    rt.preallocate_for_load_mode()
+    ref = _json.load(open(path))
+    restored = 0
+    for name, disp in _iter_moe_dispatchers(model):
+        meta = ref.get(name)
+        if meta is None:
+            continue
+        t = foundry_ops.tensor_from_ptr(
+            meta["ptr"], [meta["numel"]], [1], torch.int32,
+            torch.cuda.current_device(),
+        )
+        t.fill_(-1)
+        n_routed = disp.num_local_routed_experts
+        start = disp.moe_ep_rank * n_routed
+        t[start : start + n_routed] = torch.arange(
+            0, n_routed, dtype=torch.int32, device=t.device
+        )
+        n_shared = disp.num_local_shared_experts
+        if n_shared > 0:
+            t[-n_shared:] = torch.arange(
+                n_routed, n_routed + n_shared, dtype=torch.int32, device=t.device
+            )
+        disp.local_expert_mapping = t
+        restored += 1
+        if "hash" in meta:
+            import hashlib
+
+            digest = hashlib.sha1(
+                t.detach().contiguous().cpu().numpy().tobytes()
+            ).hexdigest()[:16]
+            if digest != meta["hash"]:
+                logger.warning(
+                    "[Foundry] EP dispatcher map content mismatch at %s: "
+                    "save=%s load=%s", name, meta["hash"], digest,
+                )
+    if restored:
+        logger.info("[Foundry] EP dispatcher maps restored (%d layers)", restored)
+
+
+def _install_param_map_probe() -> None:
+    """Record every model parameter/buffer address at SAVE and verify them at
+    LOAD.  Restored graphs read these tensors at their captured addresses, so
+    any drift (e.g. nondeterministic expert-shard loading under EP) silently
+    computes with the wrong weights."""
+    from sglang.srt.model_executor.runner import prefill_cuda_graph_runner as pr
+
+    orig = pr.PrefillCudaGraphRunner.capture
+    if getattr(orig, "_foundry_param_probe", False):
+        return
+
+    @functools.wraps(orig)
+    def patched(self, *args, **kwargs):
+        import json as _json
+
+        mode = get_graph_extension_mode()
+        try:
+            import hashlib
+
+            model = self.model_runner.model
+            snap = {n: t.data_ptr() for n, t in model.named_parameters()}
+            snap.update({"buf:" + n: t.data_ptr() for n, t in model.named_buffers()})
+            # Content hashes for small buffers — restored graphs read them at
+            # captured addresses, so stale contents silently corrupt compute.
+            for n, t in model.named_buffers():
+                if 0 < t.numel() * t.element_size() <= (1 << 20):
+                    raw = t.detach().contiguous().cpu().view(torch.uint8)
+                    snap["hash:" + n] = hashlib.sha1(bytes(raw.numpy().tobytes())).hexdigest()[:16]
+            path = os.path.join(_workspace_dir(), "model_ptr_map.json")
+            if mode == CUDAGraphExtensionMode.SAVE:
+                with open(path, "w") as f:
+                    _json.dump(snap, f)
+                logger.info("[Foundry] model ptr map saved (%d tensors)", len(snap))
+            elif mode == CUDAGraphExtensionMode.LOAD and os.path.exists(path):
+                ref = _json.load(open(path))
+                moved = [
+                    (n, hex(ref[n]), hex(snap.get(n, 0)))
+                    for n in ref
+                    if snap.get(n) != ref[n]
+                ]
+                if moved:
+                    logger.warning(
+                        "[Foundry] model ptr drift: %d/%d tensors moved; first=%s",
+                        len(moved), len(ref), moved[:5],
+                    )
+                else:
+                    logger.info(
+                        "[Foundry] model ptr map verified (%d tensors)", len(ref)
+                    )
+        except Exception as exc:
+            logger.warning("[Foundry] model ptr probe failed: %s", exc)
+        if mode == CUDAGraphExtensionMode.LOAD:
+            _restore_ep_dispatcher_maps(self.model_runner.model)
+        result = orig(self, *args, **kwargs)
+        if mode == CUDAGraphExtensionMode.SAVE:
+            _record_ep_dispatcher_maps(self.model_runner.model)
+        return result
+
+    patched._foundry_param_probe = True
+    pr.PrefillCudaGraphRunner.capture = patched
+
+
 def _install_skip_sizes_filter() -> None:
     """Drop FOUNDRY_BCG_SKIP_SIZES from the prefill runner's bucket list so
     dispatch pads those sizes up to the next available graph instead of
@@ -658,6 +835,7 @@ def install_bcg_load_hooks() -> None:
         outs = _rebuild_from_meta(out_meta["output"])
         stored = outs[0] if len(outs) == 1 else outs
 
+        _wrap_break_checksums(graph, size)
         verify_capture_inputs(size, capture_inputs)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
@@ -672,6 +850,7 @@ def install_bcg_load_hooks() -> None:
 
     _raise_allreduce_push_thresholds()
     _install_skip_sizes_filter()
+    _install_param_map_probe()
     backend_cls.capture_one = patched_capture_one
     logger.info("[Foundry] BCG load hooks installed")
 
