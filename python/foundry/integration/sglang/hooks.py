@@ -272,6 +272,13 @@ def _patch_cuda_graph_capture_v3() -> None:
             )
 
         if mode == CUDAGraphExtensionMode.LOAD:
+            # Escape hatch for stacks whose decode graphs cannot be restored
+            # yet (e.g. cluster-launch kernels pending support): re-capture
+            # decode normally while everything else stays on the LOAD path.
+            if os.environ.get("FOUNDRY_DECODE_RECAPTURE") == "1":
+                return orig_capture_one(
+                    self, shape_key, forward_fn, capture_inputs, post_warmup_hook
+                )
             # No forward, no capture — graphs are restored after the loop by
             # the runner-level patch below. Register the key order so the
             # post-pass can validate coverage.
@@ -321,6 +328,12 @@ def _patch_cuda_graph_capture_v3() -> None:
             return result
 
         # LOAD: restore every archived graph and slot into the backend maps.
+        if os.environ.get("FOUNDRY_DECODE_RECAPTURE") == "1":
+            # Decode graphs were re-captured normally (escape hatch); there is
+            # nothing to restore and the coverage check would fail.
+            rt.log_alloc_offset("after_decode_recapture")
+            return result
+
         from foundry.integration.sglang.graph_ops import load_all_graphs_v3
 
         backend = self.backend

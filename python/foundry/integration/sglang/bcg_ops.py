@@ -73,6 +73,75 @@ def scan_segment_files(workspace_dir: str) -> dict[int, list[str]]:
     }
 
 
+_ar_patched = False
+
+
+def _raise_allreduce_push_thresholds() -> None:
+    """Keep pull-algo allreduce out of BCG-covered graph captures.
+
+    The graph-mode pull kernels read capture-time side state (a per-capture
+    device pointer-table row plus peer input registrations made during
+    capture) that exists only in the process that captured the graph, so a
+    restored replay hits unmapped/garbage pointers.  The push kernel carries
+    no such state.  Raise the graph-context push threshold so every size a
+    BCG prefill graph can carry picks push at capture time.
+    """
+    global _ar_patched
+    if _ar_patched:
+        return
+    try:
+        from sglang.srt.distributed.device_communicators.configs import (
+            custom_all_reduce_v2 as ar_cfg,
+        )
+    except ImportError:
+        return
+    floor = int(os.environ.get("FOUNDRY_BCG_AR_PUSH_MB", "16")) * 1024 * 1024
+    orig = ar_cfg.get_all_reduce_config
+
+    @functools.wraps(orig)
+    def patched(world_size: int):
+        cfg = orig(world_size)
+        graph = cfg.graph
+        if graph.one_shot_push_threshold >= floor:
+            return cfg
+        logger.info(
+            "[Foundry] BCG cache: raising graph allreduce push threshold "
+            "%d -> %d bytes (pull algos bake capture-time state)",
+            graph.one_shot_push_threshold, floor,
+        )
+        return cfg._replace(
+            graph=graph._replace(
+                one_shot_push_threshold=floor,
+                one_shot_pull_threshold=max(graph.one_shot_pull_threshold, floor),
+            )
+        )
+
+    ar_cfg.get_all_reduce_config = functools.cache(patched)
+    _ar_patched = True
+
+
+def _check_no_pull_kernels(size: int) -> None:
+    """Refuse to archive a shape whose segments captured a pull allreduce —
+    its replay in another process would read capture-time-only state."""
+    import json
+
+    ws = _workspace_dir()
+    for filename in os.listdir(ws):
+        m = _BCG_FILENAME_RE.match(filename)
+        if not m or int(m.group("size")) != size:
+            continue
+        d = json.load(open(os.path.join(ws, filename)))
+        for node in d.get("nodes", []):
+            name = node.get("params", {}).get("function_name", "")
+            if "AllReducePull" in name:
+                raise RuntimeError(
+                    f"BCG SAVE size={size}: segment {filename} captured a "
+                    f"pull-algo allreduce ({name[:60]}); raise "
+                    f"FOUNDRY_BCG_AR_PUSH_MB above this shape's allreduce "
+                    f"message size so the push algo is selected"
+                )
+
+
 def install_bcg_save_hooks() -> None:
     """Route BCG segment captures through foundry graphs and archive them."""
     from sglang.srt.model_executor.runner_backend import (
@@ -96,13 +165,16 @@ def install_bcg_save_hooks() -> None:
         if get_graph_extension_mode() != CUDAGraphExtensionMode.SAVE:
             return orig_capture_one(self, shape_key, forward_fn, *args, **kwargs)
         _ctx = {"size": shape_key.size, "seg": 0, "save_time": 0.0}
+        _record_forward_closure(shape_key.size, forward_fn)
         try:
             result = orig_capture_one(self, shape_key, forward_fn, *args, **kwargs)
         finally:
             ctx, _ctx = _ctx, None
         graph = self._graphs.get(shape_key)
         if graph is not None:
+            _check_no_pull_kernels(shape_key.size)
             _record_break_metadata(graph, shape_key.size)
+            _record_capture_inputs_metadata(shape_key.size, kwargs.get("capture_inputs") or (args[0] if args else None))
             record_shared_buffer_metadata(self, shape_key, self._outputs.get(shape_key))
         logger.info(
             "[Foundry] BCG saved %d segments for size=%d (save %.3fs)",
@@ -141,6 +213,7 @@ def install_bcg_save_hooks() -> None:
         _ctx["seg"] += 1
         _ctx["save_time"] += time.perf_counter() - t0
 
+    _raise_allreduce_push_thresholds()
     backend_cls.capture_one = patched_capture_one
     capture_cls._begin_new_segment = patched_begin
     graph_cls._append_segment = patched_append
@@ -154,6 +227,57 @@ def install_bcg_save_hooks() -> None:
 # provides. Paths let LOAD substitute tensors positionally.
 # ---------------------------------------------------------------------------
 
+def _closure_leaf_metas(fn: Any) -> list[dict[str, Any]]:
+    """Tensor leaves reachable from a function's closure cells (one level of
+    object attributes), keyed by freevar-rooted path. Used to compare the
+    runner's static buffers between SAVE and LOAD."""
+    out: list[dict[str, Any]] = []
+    names = getattr(fn.__code__, "co_freevars", ())
+    cells = fn.__closure__ or ()
+    for name, cell in zip(names, cells):
+        try:
+            out.extend(_leaf_metas(cell.cell_contents, name))
+        except ValueError:
+            continue
+    # Host tensor addresses are not deterministic across processes and are
+    # never baked into device graphs — only device buffers matter here.
+    return [m for m in out if m.get("is_cuda", True)]
+
+
+def _record_forward_closure(size: int, forward_fn: Any) -> None:
+    import json
+
+    metas = _closure_leaf_metas(forward_fn)
+    path = os.path.join(_workspace_dir(), f"bcg_{size}_fwdclosure.json")
+    with open(path, "w") as f:
+        json.dump(metas, f)
+
+
+def _verify_forward_closure(size: int, forward_fn: Any) -> None:
+    import json
+
+    path = os.path.join(_workspace_dir(), f"bcg_{size}_fwdclosure.json")
+    if not os.path.exists(path):
+        return
+    saved = {m["path"]: m for m in json.load(open(path))}
+    live = {m["path"]: m for m in _closure_leaf_metas(forward_fn)}
+    moved = []
+    for p, m in saved.items():
+        lv = live.get(p)
+        if lv is not None and lv["ptr"] != m["ptr"]:
+            moved.append((p, hex(m["ptr"]), hex(lv["ptr"])))
+    missing = [p for p in saved if p not in live]
+    if moved or missing:
+        logger.warning(
+            "[Foundry] BCG closure drift size=%d: moved=%d missing=%d first=%s",
+            size, len(moved), len(missing), (moved + [(p, "-", "-") for p in missing])[:4],
+        )
+    else:
+        logger.info(
+            "[Foundry] BCG closure verified size=%d (%d leaves)", size, len(saved)
+        )
+
+
 def _tensor_meta(t: torch.Tensor) -> dict[str, Any]:
     return {
         "ptr": t.data_ptr(),
@@ -161,6 +285,7 @@ def _tensor_meta(t: torch.Tensor) -> dict[str, Any]:
         "stride": list(t.stride()),
         "dtype": str(t.dtype).removeprefix("torch."),
         "device": t.device.index or 0,
+        "is_cuda": t.is_cuda,
     }
 
 
@@ -389,6 +514,33 @@ class _CollectOnlyCapture:
         pass
 
 
+def _install_skip_sizes_filter() -> None:
+    """Drop FOUNDRY_BCG_SKIP_SIZES from the prefill runner's bucket list so
+    dispatch pads those sizes up to the next available graph instead of
+    looking up a graph that was never restored."""
+    skip = {
+        int(s) for s in os.environ.get("FOUNDRY_BCG_SKIP_SIZES", "").split(",") if s
+    }
+    if not skip:
+        return
+    from sglang.srt.model_executor.runner import prefill_cuda_graph_runner as pr
+
+    orig_capture = pr.PrefillCudaGraphRunner.capture
+
+    @functools.wraps(orig_capture)
+    def patched_capture(self, *args, **kwargs):
+        kept = [t for t in self.capture_num_tokens if t not in skip]
+        if len(kept) != len(self.capture_num_tokens):
+            logger.info(
+                "[Foundry] BCG LOAD: dropping skip sizes %s from prefill "
+                "buckets", sorted(set(self.capture_num_tokens) - set(kept)),
+            )
+            self.capture_num_tokens = kept
+        return orig_capture(self, *args, **kwargs)
+
+    pr.PrefillCudaGraphRunner.capture = patched_capture
+
+
 def install_bcg_load_hooks() -> None:
     import json
 
@@ -412,6 +564,19 @@ def install_bcg_load_hooks() -> None:
             return orig_capture_one(self, shape_key, forward_fn, capture_inputs,
                                     post_warmup_hook)
 
+        # Escape hatch for shapes whose archived kernels cannot replay in a
+        # fresh process (e.g. cuBLAS variants relying on host-initialized
+        # module globals).  Capturing live mid-restore would desync the pool
+        # trajectory, so skip the shape entirely — dispatch pads such sizes
+        # up to the next available graph.
+        skip = os.environ.get("FOUNDRY_BCG_SKIP_SIZES", "")
+        if skip and str(shape_key.size) in skip.split(","):
+            logger.info(
+                "[Foundry] BCG LOAD size=%d: skipped (FOUNDRY_BCG_SKIP_SIZES); "
+                "dispatch will pad to the next larger graph", shape_key.size,
+            )
+            return None
+
         from foundry.integration.sglang import runtime as rt
 
         # BCG restore runs before the decode runner's preallocation; the
@@ -419,6 +584,7 @@ def install_bcg_load_hooks() -> None:
         rt.preallocate_for_load_mode()
 
         size = shape_key.size
+        _verify_forward_closure(size, forward_fn)
         ws = _workspace_dir()
         meta = json.load(open(os.path.join(ws, f"bcg_{size}_meta.json")))
         out_meta = json.load(open(os.path.join(ws, f"bcg_{size}_out.json")))
@@ -492,6 +658,7 @@ def install_bcg_load_hooks() -> None:
         outs = _rebuild_from_meta(out_meta["output"])
         stored = outs[0] if len(outs) == 1 else outs
 
+        verify_capture_inputs(size, capture_inputs)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
         self._capture_inputs[shape_key] = capture_inputs
@@ -503,5 +670,47 @@ def install_bcg_load_hooks() -> None:
                 stats["shapes"], stats.get("synth", 0.0), stats["eager"], stats["restore"],
             )
 
+    _raise_allreduce_push_thresholds()
+    _install_skip_sizes_filter()
     backend_cls.capture_one = patched_capture_one
     logger.info("[Foundry] BCG load hooks installed")
+
+
+def _record_capture_inputs_metadata(size: int, capture_inputs: Any) -> None:
+    """Archive the runner's static input-buffer addresses so LOAD can verify
+    that its own buffers landed at the same place — the graph has these
+    addresses baked in, so a mismatch means garbage replay."""
+    import json
+
+    metas = _leaf_metas(capture_inputs) if capture_inputs is not None else []
+    path = os.path.join(_workspace_dir(), f"bcg_{size}_inputs.json")
+    with open(path, "w") as f:
+        json.dump({"inputs": metas}, f)
+
+
+def verify_capture_inputs(size: int, capture_inputs: Any) -> None:
+    import json
+
+    path = os.path.join(_workspace_dir(), f"bcg_{size}_inputs.json")
+    if not os.path.exists(path):
+        return
+    want = json.load(open(path))["inputs"]
+    have = _leaf_metas(capture_inputs) if capture_inputs is not None else []
+    if len(want) != len(have):
+        logger.error(
+            "[Foundry] BCG size=%d input-buffer count mismatch: archive=%d run=%d",
+            size, len(want), len(have),
+        )
+        return
+    bad = [
+        (w["path"], hex(w["ptr"]), hex(h["ptr"]))
+        for w, h in zip(want, have)
+        if w["ptr"] != h["ptr"]
+    ]
+    if bad:
+        logger.error(
+            "[Foundry] BCG size=%d INPUT-ADDR MISMATCH (%d/%d): %s",
+            size, len(bad), len(want), bad[:4],
+        )
+    else:
+        logger.info("[Foundry] BCG size=%d input buffers verified (%d)", size, len(want))
