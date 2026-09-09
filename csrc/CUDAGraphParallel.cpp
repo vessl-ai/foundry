@@ -517,15 +517,54 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         kernel_nodes_for_common_attrs.push_back(cuNode);
       }
 
+      // Diagnostic wrapper: name the kernel and attribute when a set fails —
+      // the driver error alone does not identify the node.
+      auto attr_diag = [&](CUresult r, const char* what) {
+        if (r != CUDA_SUCCESS) {
+          const char* es = nullptr;
+          cuGetErrorString(r, &es);
+          fprintf(stderr,
+                  "[foundry LOAD ERROR] set %s failed for kernel %s "
+                  "(grid=%u,%u,%u cluster=%d,%d,%d sched=%d msd=%d): %s\n",
+                  what, function_name.c_str(), (unsigned)node_params.gridDimX,
+                  (unsigned)node_params.gridDimY, (unsigned)node_params.gridDimZ,
+                  cluster_width, cluster_height, cluster_depth, cluster_scheduling,
+                  mem_sync_domain, es ? es : "?");
+        }
+        return r;
+      };
+
       // Per-node attributes (only present if they differ from common or no common extraction)
       if (cluster_width > 0 || cluster_height > 0 || cluster_depth > 0) {
+        // Clusters larger than the portable limit (8 CTAs) can only launch
+        // when the function opts in via NON_PORTABLE_CLUSTER_SIZE_ALLOWED —
+        // the original launch set this before capture, so mirror it here or
+        // the clusterDim set below fails with "cluster misconfiguration"
+        // (seen with trtllm-gen sm100 fmha decode kernels, cluster 16x1x1).
+        long total_ctas = (long)std::max(cluster_width, 1) * std::max(cluster_height, 1) *
+                          std::max(cluster_depth, 1);
+        if (total_ctas > 8) {
+          if (std::holds_alternative<CUkernel>(func_handle_variant)) {
+            CUdevice diag_dev = 0;
+            cuCtxGetDevice(&diag_dev);
+            C10_CUDA_DRIVER_CHECK(attr_diag(
+                cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1,
+                                     std::get<CUkernel>(func_handle_variant), diag_dev),
+                "non_portable_cluster(kern)"));
+          } else {
+            C10_CUDA_DRIVER_CHECK(attr_diag(
+                cuFuncSetAttribute(std::get<CUfunction>(func_handle_variant),
+                                   CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1),
+                "non_portable_cluster(func)"));
+          }
+        }
         CUkernelNodeAttrValue clusterAttr;
         memset(&clusterAttr, 0, sizeof(clusterAttr));
         clusterAttr.clusterDim.x = cluster_width > 0 ? cluster_width : 1;
         clusterAttr.clusterDim.y = cluster_height > 0 ? cluster_height : 1;
         clusterAttr.clusterDim.z = cluster_depth > 0 ? cluster_depth : 1;
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
-            cuNode, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, &clusterAttr));
+        C10_CUDA_DRIVER_CHECK(attr_diag(cuGraphKernelNodeSetAttribute(
+            cuNode, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, &clusterAttr), "cluster_dim"));
       }
       if (has_preferred_cluster_dim) {
         CUkernelNodeAttrValue pref_attr;
@@ -541,8 +580,9 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         memset(&sched_attr, 0, sizeof(sched_attr));
         sched_attr.clusterSchedulingPolicyPreference =
             static_cast<CUclusterSchedulingPolicy>(cluster_scheduling);
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
-            cuNode, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE, &sched_attr));
+        C10_CUDA_DRIVER_CHECK(attr_diag(cuGraphKernelNodeSetAttribute(
+            cuNode, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE, &sched_attr),
+            "cluster_scheduling"));
       }
       if (has_cooperative) {
         CUkernelNodeAttrValue coop_attr;
@@ -562,16 +602,18 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         CUkernelNodeAttrValue mem_domain_attr;
         memset(&mem_domain_attr, 0, sizeof(mem_domain_attr));
         mem_domain_attr.memSyncDomain = static_cast<CUlaunchMemSyncDomain>(mem_sync_domain);
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
-            cuNode, CU_KERNEL_NODE_ATTRIBUTE_MEM_SYNC_DOMAIN, &mem_domain_attr));
+        C10_CUDA_DRIVER_CHECK(attr_diag(cuGraphKernelNodeSetAttribute(
+            cuNode, CU_KERNEL_NODE_ATTRIBUTE_MEM_SYNC_DOMAIN, &mem_domain_attr),
+            "mem_sync_domain"));
       }
       if (has_mem_sync_domain_map) {
         CUkernelNodeAttrValue mem_map_attr;
         memset(&mem_map_attr, 0, sizeof(mem_map_attr));
         mem_map_attr.memSyncDomainMap.default_ = mem_sync_domain_default;
         mem_map_attr.memSyncDomainMap.remote = mem_sync_domain_remote;
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
-            cuNode, CU_KERNEL_NODE_ATTRIBUTE_MEM_SYNC_DOMAIN_MAP, &mem_map_attr));
+        C10_CUDA_DRIVER_CHECK(attr_diag(cuGraphKernelNodeSetAttribute(
+            cuNode, CU_KERNEL_NODE_ATTRIBUTE_MEM_SYNC_DOMAIN_MAP, &mem_map_attr),
+            "mem_sync_domain_map"));
       }
       if (has_preferred_shared_mem_carveout) {
         CUkernelNodeAttrValue carveout_attr;

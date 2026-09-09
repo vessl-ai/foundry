@@ -536,6 +536,23 @@ void CUDAGraph::replay() {
             // Update kernel node attributes that may differ across batch sizes
             auto& a = u.kernel_attrs;
             if (a.has_cluster_dim) {
+              // >8-CTA clusters need NON_PORTABLE_CLUSTER_SIZE_ALLOWED on the
+              // function first (see load-path comment).
+              long total_ctas = (long)std::max(a.clusterDimX, 1u) * std::max(a.clusterDimY, 1u) *
+                                std::max(a.clusterDimZ, 1u);
+              if (total_ctas > 8) {
+                if (u.kernel_params.kern != nullptr) {
+                  CUdevice od_dev = 0;
+                  cuCtxGetDevice(&od_dev);
+                  C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(
+                      CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1,
+                      u.kernel_params.kern, od_dev));
+                } else if (u.kernel_params.func != nullptr) {
+                  C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
+                      u.kernel_params.func, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+                      1));
+                }
+              }
               CUkernelNodeAttrValue attr;
               memset(&attr, 0, sizeof(attr));
               attr.clusterDim.x = a.clusterDimX > 0 ? a.clusterDimX : 1;
@@ -2041,6 +2058,24 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
       // Set kernel node attributes — only non-default attributes are
       // present in JSON (filtered at save time), so load blindly calls APIs.
       if (cluster_width > 0 || cluster_height > 0 || cluster_depth > 0) {
+        // Clusters beyond the portable limit (8 CTAs) require the function to
+        // opt in via NON_PORTABLE_CLUSTER_SIZE_ALLOWED — the original launch
+        // did this before capture, so mirror it or the clusterDim set fails
+        // with "cluster misconfiguration" (trtllm-gen sm100 fmha, 16x1x1).
+        long total_ctas = (long)std::max(cluster_width, 1) * std::max(cluster_height, 1) *
+                          std::max(cluster_depth, 1);
+        if (total_ctas > 8) {
+          if (std::holds_alternative<CUkernel>(func_handle_variant)) {
+            C10_CUDA_DRIVER_CHECK(
+                cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1,
+                                     std::get<CUkernel>(func_handle_variant),
+                                     graph->capture_dev_));
+          } else {
+            C10_CUDA_DRIVER_CHECK(
+                cuFuncSetAttribute(std::get<CUfunction>(func_handle_variant),
+                                   CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1));
+          }
+        }
         CUkernelNodeAttrValue clusterAttr;
         memset(&clusterAttr, 0, sizeof(clusterAttr));
         clusterAttr.clusterDim.x = cluster_width > 0 ? cluster_width : 1;
