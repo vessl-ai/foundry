@@ -517,6 +517,47 @@ void CUDAGraph::instantiate() {
   has_graph_exec_ = true;
 }
 
+// FOUNDRY_DUMP_NODE=<substr>: dump everything the driver knows about a kernel
+// node whose function name contains <substr> — launch params, every kernel
+// node attribute (ids 1..16, raw bytes) and every function attribute of the
+// handle — so a natively captured node can be diffed against its rebuilt twin.
+static void foundry_dump_kernel_node(const char* where, CUgraphNode node, CUfunction func,
+                                     CUkernel kern) {
+  const char* want = getenv("FOUNDRY_DUMP_NODE");
+  if (!want || !*want) return;
+  const char* nm = nullptr;
+  if (kern) cuKernelGetName(&nm, kern);
+  else if (func) cuFuncGetName(&nm, func);
+  if (!nm || !strstr(nm, want)) return;
+  CUDA_KERNEL_NODE_PARAMS p;
+  memset(&p, 0, sizeof(p));
+  cuGraphKernelNodeGetParams(node, &p);
+  fprintf(stderr,
+          "[foundry NODE-DUMP %s] %s grid=%u,%u,%u block=%u,%u,%u smem=%u func=%p kern=%p "
+          "ctx=%p kernelParams=%p extra=%p\n",
+          where, nm, p.gridDimX, p.gridDimY, p.gridDimZ, p.blockDimX, p.blockDimY, p.blockDimZ,
+          p.sharedMemBytes, (void*)p.func, (void*)p.kern, (void*)p.ctx, (void*)p.kernelParams,
+          (void*)p.extra);
+  for (int id = 1; id <= 16; ++id) {
+    CUkernelNodeAttrValue v;
+    memset(&v, 0, sizeof(v));
+    CUresult r = cuGraphKernelNodeGetAttribute(node, (CUkernelNodeAttrID)id, &v);
+    char hex[80] = {0};
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(&v);
+    for (int i = 0; i < 32; ++i) snprintf(hex + i * 2, 3, "%02x", b[i]);
+    fprintf(stderr, "[foundry NODE-DUMP %s]   nodeattr[%2d] res=%d val=%s\n", where, id, (int)r, hex);
+  }
+  CUdevice dev = 0;
+  cuCtxGetDevice(&dev);
+  for (int a = 0; a <= 15; ++a) {
+    int val = -999999;
+    CUresult r = kern ? cuKernelGetAttribute(&val, (CUfunction_attribute)a, kern, dev)
+                      : (func ? cuFuncGetAttribute(&val, (CUfunction_attribute)a, func)
+                              : CUDA_ERROR_INVALID_VALUE);
+    fprintf(stderr, "[foundry NODE-DUMP %s]   funcattr[%2d] res=%d val=%d\n", where, a, (int)r, val);
+  }
+}
+
 void CUDAGraph::replay() {
   // On-demand replay: update shared graph nodes + cuGraphExecUpdate, then launch.
   if (on_demand_data_) {
@@ -1081,6 +1122,7 @@ void CUDAGraph::analyze_captured_graph() {
         }
       }
 
+      foundry_dump_kernel_node("SAVE-native", nodes[i], params.func, params.kern);
       graphNode.metadata = std::move(metadata);
     } else if (nodeType == CU_GRAPH_NODE_TYPE_MEMSET) {
       CUDA_MEMSET_NODE_PARAMS params;
@@ -1311,8 +1353,13 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
         kernel_node_attrs["attrQueryAvailable"] = metadata.node_attrs.attr_query_available;
         // cluster_dim: default is 1x1x1, only save if any dimension > 1
         if (metadata.node_attrs.has_cluster_dim &&
-            (metadata.node_attrs.clusterDimX > 1 || metadata.node_attrs.clusterDimY > 1 ||
-             metadata.node_attrs.clusterDimZ > 1)) {
+            // Keep any explicitly set cluster dimension, *including* 1x1x1: a
+            // kernel launched with clusterDim=(1,1,1) runs in cluster mode and
+            // may execute cluster-scoped instructions (barrier.cluster,
+            // tcgen05 cta_group ops) that trap with "illegal instruction" when
+            // relaunched without a cluster (seen: cuBLAS nvjet *_1x1_* on B200).
+            (metadata.node_attrs.clusterDimX > 0 || metadata.node_attrs.clusterDimY > 0 ||
+             metadata.node_attrs.clusterDimZ > 0)) {
           kernel_node_attrs["clusterDimX"] = metadata.node_attrs.clusterDimX;
           kernel_node_attrs["clusterDimY"] = metadata.node_attrs.clusterDimY;
           kernel_node_attrs["clusterDimZ"] = metadata.node_attrs.clusterDimZ;
@@ -2222,6 +2269,7 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
         C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
             cuNode, CU_KERNEL_NODE_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE, &updatable_attr));
       }
+      foundry_dump_kernel_node("LOAD-rebuilt", cuNode, node_params.func, node_params.kern);
     } else if (node_type == "MemcpyNode") {
       CUDA_MEMCPY3D copy_params;
       memset(&copy_params, 0, sizeof(copy_params));
