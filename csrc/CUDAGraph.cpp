@@ -14,6 +14,8 @@
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
 
 #include <cstddef>
+#include <map>
+#include <array>
 #include <cstring>
 #include <iostream>
 #include <unordered_map>
@@ -493,8 +495,16 @@ void CUDAGraph::instantiate() {
 #endif
 #if !defined(USE_ROCM) || ROCM_VERSION >= 60200
   } else {
-    cudaError_t inst_err = cudaGraphInstantiateWithFlags(&graph_exec_, graph_,
-                                                         cudaGraphInstantiateFlagAutoFreeOnLaunch);
+    // PyTorch's native CUDAGraph instantiates with flags=0.  foundry defaults
+    // to AutoFreeOnLaunch (frees graph-owned allocations on every launch),
+    // which a repeatedly-replayed decode graph pays per launch.  Let an env
+    // switch drop it so we can measure/recover native-parity throughput.
+    unsigned long long _inst_flags =
+        (getenv("FOUNDRY_INSTANTIATE_NO_AUTOFREE") != nullptr)
+            ? 0ULL
+            : cudaGraphInstantiateFlagAutoFreeOnLaunch;
+    cudaError_t inst_err =
+        cudaGraphInstantiateWithFlags(&graph_exec_, graph_, _inst_flags);
     if (inst_err != cudaSuccess) {
       fprintf(
           stderr,
@@ -511,6 +521,11 @@ void CUDAGraph::replay() {
   // On-demand replay: update shared graph nodes + cuGraphExecUpdate, then launch.
   if (on_demand_data_) {
     auto& shared = on_demand_data_->shared_exec;
+    // --- replay profiling (FOUNDRY_REPLAY_PROF=1): split per-launch CPU submit
+    // time from GPU graph-execution time to locate the cached-decode overhead.
+    static const bool _rprof = getenv("FOUNDRY_REPLAY_PROF") != nullptr;
+    std::chrono::steady_clock::time_point _rp_cpu0;
+    if (_rprof) _rp_cpu0 = std::chrono::steady_clock::now();
 #ifdef FOUNDRY_DEBUG_REPLAY
     fprintf(stderr,
             "[foundry REPLAY] graph %d (%s): current_params_id=%d, shared_exec=%p, updates=%zu\n",
@@ -673,8 +688,33 @@ void CUDAGraph::replay() {
     fprintf(stderr, "[foundry DEBUG] graph %d: launching on stream %p...\n",
             on_demand_data_->graph_id, (void*)at::cuda::getCurrentCUDAStream().stream());
 #endif
-    AT_CUDA_CHECK(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(shared->exec),
-                                  at::cuda::getCurrentCUDAStream()));
+    if (_rprof) {
+      static thread_local cudaEvent_t _e0 = nullptr, _e1 = nullptr;
+      static thread_local long _n = 0, _gn = 0;
+      static thread_local double _cpu = 0, _gpu = 0;
+      if (_e0 == nullptr) { cudaEventCreate(&_e0); cudaEventCreate(&_e1); }
+      cudaStream_t _st = at::cuda::getCurrentCUDAStream().stream();
+      bool _samp = (_n % 200 == 0);
+      if (_samp) cudaEventRecord(_e0, _st);
+      AT_CUDA_CHECK(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(shared->exec), _st));
+      if (_samp) cudaEventRecord(_e1, _st);
+      _cpu += std::chrono::duration<double, std::micro>(
+                  std::chrono::steady_clock::now() - _rp_cpu0).count();
+      _n++;
+      if (_samp) {
+        cudaEventSynchronize(_e1);
+        float _ms = 0; cudaEventElapsedTime(&_ms, _e0, _e1); _gpu += _ms; _gn++;
+      }
+      if (_n % 200 == 0) {
+        fprintf(stderr,
+                "[foundry REPLAY-PROF] launches=%ld cpu_submit_avg=%.1fus "
+                "gpu_exec_avg=%.3fms (gpu_n=%ld)\n",
+                _n, _cpu / _n, _gpu / (_gn > 0 ? _gn : 1), _gn);
+      }
+    } else {
+      AT_CUDA_CHECK(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(shared->exec),
+                                    at::cuda::getCurrentCUDAStream()));
+    }
 #ifdef FOUNDRY_DEBUG_REPLAY
     fprintf(stderr, "[foundry DEBUG] graph %d: launched (async)\n", on_demand_data_->graph_id);
 #endif
@@ -1139,16 +1179,38 @@ void CUDAGraph::analyze_captured_graph() {
       node_to_index[nodes[i]] = i;
     }
 
+    // FOUNDRY_EDGE_HIST=1: tally CUDA edge data (type / ports) of the *natively
+    // captured* graph so we can measure whether any non-DEFAULT (PDL) edges
+    // exist — those are dropped by the from/to-only serialization below.
+    static const bool _edge_hist = getenv("FOUNDRY_EDGE_HIST") != nullptr;
+    size_t _h_type[4] = {0, 0, 0, 0}, _h_from[4] = {0, 0, 0, 0}, _h_to[4] = {0, 0, 0, 0};
     for (size_t i = 0; i < numEdges; i++) {
       auto from_it = node_to_index.find(from_nodes[i]);
       auto to_it = node_to_index.find(to_nodes[i]);
 
+      if (_edge_hist) {
+        _h_type[edges[i].type < 4 ? edges[i].type : 3]++;
+        _h_from[edges[i].from_port < 4 ? edges[i].from_port : 3]++;
+        _h_to[edges[i].to_port < 4 ? edges[i].to_port : 3]++;
+      }
       if (from_it != node_to_index.end() && to_it != node_to_index.end()) {
         GraphDependency dep;
         dep.from_index = from_it->second;
         dep.to_index = to_it->second;
+        dep.type = edges[i].type;
+        dep.from_port = edges[i].from_port;
+        dep.to_port = edges[i].to_port;
         graph_dependencies.push_back(dep);
       }
+    }
+    if (_edge_hist) {
+      fprintf(stderr,
+              "[foundry EDGE-HIST] nodes=%zu edges=%zu type{default=%zu,programmatic=%zu,other=%zu} "
+              "from_port{default=%zu,programmatic=%zu,launch_order=%zu,other=%zu} "
+              "to_port{default=%zu,programmatic=%zu,launch_order=%zu,other=%zu}\n",
+              nodes.size(), numEdges, _h_type[0], _h_type[1], _h_type[2] + _h_type[3],
+              _h_from[0], _h_from[1], _h_from[2], _h_from[3],
+              _h_to[0], _h_to[1], _h_to[2], _h_to[3]);
     }
   }
 }
@@ -1660,6 +1722,9 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
     json::object dep_obj;
     dep_obj["from"] = dep.from_index;
     dep_obj["to"] = dep.to_index;
+    if (dep.type != 0) dep_obj["type"] = static_cast<int>(dep.type);
+    if (dep.from_port != 0) dep_obj["from_port"] = static_cast<int>(dep.from_port);
+    if (dep.to_port != 0) dep_obj["to_port"] = static_cast<int>(dep.to_port);
     deps_array.push_back(dep_obj);
   }
   root["dependencies"] = deps_array;
@@ -2269,6 +2334,11 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
     from_nodes.reserve(deps_array.size());
     to_nodes.reserve(deps_array.size());
 
+    // Restore CUDA edge data (PDL/programmatic edges) — dropping it would turn
+    // every programmatic edge into a full-serialization edge and lose the
+    // kernel overlap the original capture had.
+    std::vector<CUgraphEdgeData> edge_data;
+    edge_data.reserve(deps_array.size());
     for (const auto& dep_val : deps_array) {
       const json::object& dep_obj = dep_val.as_object();
       int from_id = dep_obj.at("from").to_number<int>();
@@ -2276,19 +2346,55 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
 
       from_nodes.push_back(id_to_node[from_id]);
       to_nodes.push_back(id_to_node[to_id]);
+      CUgraphEdgeData ed;
+      memset(&ed, 0, sizeof(ed));
+      if (dep_obj.contains("type")) ed.type = (unsigned char)dep_obj.at("type").to_number<int>();
+      if (dep_obj.contains("from_port"))
+        ed.from_port = (unsigned char)dep_obj.at("from_port").to_number<int>();
+      if (dep_obj.contains("to_port"))
+        ed.to_port = (unsigned char)dep_obj.at("to_port").to_number<int>();
+      edge_data.push_back(ed);
     }
 
+    // Issue one cuGraphAddDependencies per *homogeneous* edge-data group.  The
+    // driver does not honor a mixed edgeData array (measured: a batch mixing
+    // DEFAULT and PROGRAMMATIC entries came back all-DEFAULT, while the same
+    // typed edge re-added alone read back PROGRAMMATIC).
+    {
+      std::map<std::array<unsigned char, 3>, std::vector<size_t>> groups;
+      for (size_t i = 0; i < edge_data.size(); i++)
+        groups[{edge_data[i].type, edge_data[i].from_port, edge_data[i].to_port}].push_back(i);
+      for (auto& [key, idxs] : groups) {
+        std::vector<CUgraphNode> gf, gt;
+        std::vector<CUgraphEdgeData> ge;
+        gf.reserve(idxs.size()); gt.reserve(idxs.size()); ge.reserve(idxs.size());
+        for (size_t i : idxs) { gf.push_back(from_nodes[i]); gt.push_back(to_nodes[i]); ge.push_back(edge_data[i]); }
+        bool all_zero = (key[0] == 0 && key[1] == 0 && key[2] == 0);
 #if (defined(CUDA_VERSION) && CUDA_VERSION >= 13000)
-    CUresult dep_result = cuGraphAddDependencies(cuGraph, from_nodes.data(), to_nodes.data(),
-                                                 nullptr, deps_array.size());
+        CUresult gr = cuGraphAddDependencies(cuGraph, gf.data(), gt.data(),
+                                             all_zero ? nullptr : ge.data(), gf.size());
 #else
-    CUresult dep_result = cuGraphAddDependencies_v2(cuGraph, from_nodes.data(), to_nodes.data(),
-                                                    nullptr, deps_array.size());
+        CUresult gr = cuGraphAddDependencies_v2(cuGraph, gf.data(), gt.data(),
+                                                all_zero ? nullptr : ge.data(), gf.size());
 #endif
-    if (dep_result != CUDA_SUCCESS) {
-      fprintf(stderr, "[foundry LOAD ERROR] cuGraphAddDependencies FAILED with error %d\n",
-              dep_result);
-      C10_CUDA_DRIVER_CHECK(dep_result);
+        if (gr != CUDA_SUCCESS) {
+          fprintf(stderr, "[foundry LOAD ERROR] cuGraphAddDependencies FAILED (group type=%d fp=%d tp=%d n=%zu) err=%d\n",
+                  (int)key[0], (int)key[1], (int)key[2], gf.size(), (int)gr);
+          C10_CUDA_DRIVER_CHECK(gr);
+        }
+      }
+    }
+
+    if (getenv("FOUNDRY_EDGE_HIST") != nullptr) {
+      size_t nE = 0;
+      cuGraphGetEdges(cuGraph, nullptr, nullptr, nullptr, &nE);
+      std::vector<CUgraphNode> ef(nE), et(nE);
+      std::vector<CUgraphEdgeData> ed(nE);
+      cuGraphGetEdges(cuGraph, ef.data(), et.data(), ed.data(), &nE);
+      size_t prog = 0, fp1 = 0;
+      for (size_t i = 0; i < nE; i++) { prog += (ed[i].type == 1); fp1 += (ed[i].from_port == 1); }
+      fprintf(stderr, "[foundry EDGE-HIST-LOAD] %s edges=%zu programmatic_type=%zu from_port_prog=%zu\n",
+              "direct-build", nE, prog, fp1);
     }
   }
   // Register the memory pool with PyTorch's caching allocator before instantiation.

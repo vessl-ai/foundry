@@ -14,6 +14,9 @@
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
 
 #include <cstddef>
+#include <algorithm>
+#include <map>
+#include <array>
 #include <cstring>
 #include <iostream>
 #include <unordered_map>
@@ -823,23 +826,76 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
     from_nodes.reserve(deps_array.size());
     to_nodes.reserve(deps_array.size());
 
+    // Restore CUDA edge data (PDL/programmatic edges); see CUDAGraph.cpp.
+    std::vector<CUgraphEdgeData> edge_data;
+    edge_data.reserve(deps_array.size());
     for (const auto& dep_val : deps_array) {
       const json::object& dep_obj = dep_val.as_object();
       from_nodes.push_back(id_to_node[dep_obj.at("from").to_number<int>()]);
       to_nodes.push_back(id_to_node[dep_obj.at("to").to_number<int>()]);
+      CUgraphEdgeData ed;
+      memset(&ed, 0, sizeof(ed));
+      if (dep_obj.contains("type")) ed.type = (unsigned char)dep_obj.at("type").to_number<int>();
+      if (dep_obj.contains("from_port"))
+        ed.from_port = (unsigned char)dep_obj.at("from_port").to_number<int>();
+      if (dep_obj.contains("to_port"))
+        ed.to_port = (unsigned char)dep_obj.at("to_port").to_number<int>();
+      edge_data.push_back(ed);
     }
 
+    // Issue one cuGraphAddDependencies per *homogeneous* edge-data group.  The
+    // driver does not honor a mixed edgeData array (measured: a batch mixing
+    // DEFAULT and PROGRAMMATIC entries came back all-DEFAULT, while the same
+    // typed edge re-added alone read back PROGRAMMATIC).
+    {
+      std::map<std::array<unsigned char, 3>, std::vector<size_t>> groups;
+      for (size_t i = 0; i < edge_data.size(); i++)
+        groups[{edge_data[i].type, edge_data[i].from_port, edge_data[i].to_port}].push_back(i);
+      for (auto& [key, idxs] : groups) {
+        std::vector<CUgraphNode> gf, gt;
+        std::vector<CUgraphEdgeData> ge;
+        gf.reserve(idxs.size()); gt.reserve(idxs.size()); ge.reserve(idxs.size());
+        for (size_t i : idxs) { gf.push_back(from_nodes[i]); gt.push_back(to_nodes[i]); ge.push_back(edge_data[i]); }
+        bool all_zero = (key[0] == 0 && key[1] == 0 && key[2] == 0);
 #if (defined(CUDA_VERSION) && CUDA_VERSION >= 13000)
-    CUresult dep_result = cuGraphAddDependencies(cuGraph, from_nodes.data(), to_nodes.data(),
-                                                 nullptr, deps_array.size());
+        CUresult gr = cuGraphAddDependencies(cuGraph, gf.data(), gt.data(),
+                                             all_zero ? nullptr : ge.data(), gf.size());
 #else
-    CUresult dep_result = cuGraphAddDependencies_v2(cuGraph, from_nodes.data(), to_nodes.data(),
-                                                    nullptr, deps_array.size());
+        CUresult gr = cuGraphAddDependencies_v2(cuGraph, gf.data(), gt.data(),
+                                                all_zero ? nullptr : ge.data(), gf.size());
 #endif
-    if (dep_result != CUDA_SUCCESS) {
-      fprintf(stderr, "[foundry LOAD ERROR] cuGraphAddDependencies FAILED with error %d\n",
-              dep_result);
-      C10_CUDA_DRIVER_CHECK(dep_result);
+        if (gr != CUDA_SUCCESS) {
+          fprintf(stderr, "[foundry LOAD ERROR] cuGraphAddDependencies FAILED (group type=%d fp=%d tp=%d n=%zu) err=%d\n",
+                  (int)key[0], (int)key[1], (int)key[2], gf.size(), (int)gr);
+          C10_CUDA_DRIVER_CHECK(gr);
+        }
+      }
+    }
+
+    if (getenv("FOUNDRY_EDGE_HIST") != nullptr) {
+      size_t nE = 0;
+      cuGraphGetEdges(cuGraph, nullptr, nullptr, nullptr, &nE);
+      std::vector<CUgraphNode> ef(nE), et(nE);
+      std::vector<CUgraphEdgeData> ed(nE);
+      cuGraphGetEdges(cuGraph, ef.data(), et.data(), ed.data(), &nE);
+      size_t prog = 0, fp1 = 0;
+      for (size_t i = 0; i < nE; i++) { prog += (ed[i].type == 1); fp1 += (ed[i].from_port == 1); }
+      size_t json_prog = 0;
+      for (const auto& dv : deps_array) if (dv.as_object().contains("type")) json_prog++;
+      fprintf(stderr, "[foundry EDGE-HIST-LOAD] %s edges=%zu programmatic_type=%zu from_port_prog=%zu json_typed=%zu edge_data_typed=%zu\n",
+              "parsed-build", nE, prog, fp1, json_prog,
+              (size_t)std::count_if(edge_data.begin(), edge_data.end(), [](const CUgraphEdgeData& e){ return e.type == 1; }));
+      // node kinds of first 2 typed deps (are they kernel->kernel after id mapping?)
+      int shown = 0;
+      for (size_t i = 0; i < deps_array.size() && shown < 2; i++) {
+        const auto& o = deps_array[i].as_object();
+        if (!o.contains("type")) continue;
+        CUgraphNodeType tf, tt;
+        cuGraphNodeGetType(from_nodes[i], &tf); cuGraphNodeGetType(to_nodes[i], &tt);
+        fprintf(stderr, "[foundry EDGE-HIST-LOAD]   typed dep #%zu: from id=%d type=%d -> to id=%d type=%d (kernel=%d)\n",
+                i, o.at("from").to_number<int>(), (int)tf, o.at("to").to_number<int>(), (int)tt, (int)CU_GRAPH_NODE_TYPE_KERNEL);
+        shown++;
+      }
     }
   }
 

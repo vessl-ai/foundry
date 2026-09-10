@@ -49,7 +49,8 @@ enum SectionType : uint32_t {
   SECTION_ALLOCATOR_EVENTS = 8,
   SECTION_OUTPUT_TENSORS = 9,
   SECTION_TOPOLOGY_KEY = 10,
-  SECTION_COUNT = 11,
+  SECTION_EDGE_DATA = 11,  // per-dependency CUgraphEdgeData (type/ports), FLAG_HAS_EDGE_DATA
+  SECTION_COUNT = 12,
 };
 
 enum HeaderFlags : uint32_t {
@@ -58,6 +59,7 @@ enum HeaderFlags : uint32_t {
   FLAG_HAS_ALLOCATOR_EVENTS = 1 << 2,
   FLAG_HAS_OUTPUT_TENSORS = 1 << 3,
   FLAG_HAS_GENERATORS = 1 << 4,
+  FLAG_HAS_EDGE_DATA = 1 << 5,
 };
 
 #pragma pack(push, 1)
@@ -225,6 +227,15 @@ struct BinDependency {
   uint32_t to_id;
 };
 static_assert(sizeof(BinDependency) == 8, "BinDependency must be 8 bytes");
+
+// Parallel to the dependency table (same index): CUDA edge data.
+struct BinEdgeData {
+  uint8_t type;       // CUgraphDependencyType (1 = PROGRAMMATIC / PDL)
+  uint8_t from_port;  // CU_GRAPH_KERNEL_NODE_PORT_*
+  uint8_t to_port;
+  uint8_t _pad;
+};
+static_assert(sizeof(BinEdgeData) == 4, "BinEdgeData must be 4 bytes");
 
 #pragma pack(pop)
 

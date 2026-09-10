@@ -268,9 +268,18 @@ void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::obje
   // ---- Dependencies ----
   std::vector<bf::BinDependency> deps;
   deps.reserve(deps_array.size());
+  std::vector<bf::BinEdgeData> edge_data;
+  edge_data.reserve(deps_array.size());
+  bool has_edge_data = false;
   for (const auto& dep_val : deps_array) {
     const json::object& d = dep_val.as_object();
     deps.push_back({d.at("from").to_number<uint32_t>(), d.at("to").to_number<uint32_t>()});
+    bf::BinEdgeData e = {};
+    if (d.contains("type")) e.type = (uint8_t)d.at("type").to_number<int>();
+    if (d.contains("from_port")) e.from_port = (uint8_t)d.at("from_port").to_number<int>();
+    if (d.contains("to_port")) e.to_port = (uint8_t)d.at("to_port").to_number<int>();
+    if (e.type || e.from_port || e.to_port) has_edge_data = true;
+    edge_data.push_back(e);
   }
 
   // ---- Generators ----
@@ -313,6 +322,8 @@ void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::obje
   place_section(bf::SECTION_ALLOCATOR_EVENTS, alloc_events_json.size());
   place_section(bf::SECTION_OUTPUT_TENSORS, output_tensors_json.size());
   place_section(bf::SECTION_TOPOLOGY_KEY, topology_key.size());
+  place_section(bf::SECTION_EDGE_DATA,
+                has_edge_data ? edge_data.size() * sizeof(bf::BinEdgeData) : 0);
 
   // ---- Write ----
   std::ofstream out(bin_path, std::ios::binary);
@@ -335,6 +346,8 @@ void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::obje
     header.flags |= bf::FLAG_HAS_OUTPUT_TENSORS;
   if (!gens.empty())
     header.flags |= bf::FLAG_HAS_GENERATORS;
+  if (has_edge_data)
+    header.flags |= bf::FLAG_HAS_EDGE_DATA;
   header.num_nodes = static_cast<uint32_t>(node_entries.size());
   header.num_dependencies = static_cast<uint32_t>(deps.size());
   header.num_generators = static_cast<uint32_t>(gens.size());
@@ -366,6 +379,8 @@ void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::obje
   write_padded(alloc_events_json.data(), alloc_events_json.size());
   write_padded(output_tensors_json.data(), output_tensors_json.size());
   write_padded(topology_key.data(), topology_key.size());
+  if (has_edge_data)
+    write_padded(edge_data.data(), edge_data.size() * sizeof(bf::BinEdgeData));
 
   out.close();
 }
@@ -656,10 +671,21 @@ boost::json::value read_and_parse_binary_graph(const std::string& bin_path) {
     const bf::BinDependency* deps = reinterpret_cast<const bf::BinDependency*>(dep_data);
     json::array deps_array;
     deps_array.reserve(header.num_dependencies);
+    const bf::BinEdgeData* edata = nullptr;
+    if (header.flags & bf::FLAG_HAS_EDGE_DATA) {
+      auto [ed_data, ed_size] = section(bf::SECTION_EDGE_DATA);
+      if (ed_size >= header.num_dependencies * sizeof(bf::BinEdgeData))
+        edata = reinterpret_cast<const bf::BinEdgeData*>(ed_data);
+    }
     for (uint32_t i = 0; i < header.num_dependencies; i++) {
       json::object d;
       d["from"] = deps[i].from_id;
       d["to"] = deps[i].to_id;
+      if (edata) {
+        if (edata[i].type) d["type"] = (int)edata[i].type;
+        if (edata[i].from_port) d["from_port"] = (int)edata[i].from_port;
+        if (edata[i].to_port) d["to_port"] = (int)edata[i].to_port;
+      }
       deps_array.push_back(d);
     }
     root["dependencies"] = std::move(deps_array);

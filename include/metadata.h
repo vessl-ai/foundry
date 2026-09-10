@@ -202,6 +202,11 @@ struct EmptyNodeMetadata {};
 struct GraphDependency {
   int from_index;
   int to_index;
+  // CUDA edge data (CUgraphEdgeData). 0 = ordinary full-completion edge.
+  // type 1 = PROGRAMMATIC (PDL): downstream may start before upstream finishes.
+  unsigned char type = 0;
+  unsigned char from_port = 0;
+  unsigned char to_port = 0;
 };
 
 using GraphNodeMetadata =

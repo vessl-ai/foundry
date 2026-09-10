@@ -396,7 +396,7 @@ def load_all_graphs(cuda_graph_runner) -> None:
         state.loaded_graphs[meta["key"]] = (graph, _unpack_output(tensors))
 
 
-def load_all_graphs_v3(backend, shape_keys) -> None:
+def load_all_graphs_v3(backend, shape_keys, registry=None) -> None:
     """v3 (runner_backend era) LOAD: restore archived graphs into a
     FullCudaGraphBackend's ``_graphs``/``_outputs`` maps.
 
@@ -430,11 +430,33 @@ def load_all_graphs_v3(backend, shape_keys) -> None:
     cge.init_nvshmem_for_loaded_modules()
 
     paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
+    # (A) rebind decode-graph slot addresses to the runner's actual LOAD slots
+    # before restore (in-place, so graph_manifest filename refs still resolve),
+    # then restore the originals after load.
+    _rebind_backed = []
+    if registry is not None and os.environ.get("FOUNDRY_DECODE_REBIND") == "1":
+        # Graph address-rebind is structurally insufficient (only the 11 registry
+        # slots are enumerable, but the decode graph references many more drifted
+        # torch buffers).  Kept behind an env flag for diagnostics; the real fix
+        # is allocation-order determinism (empty_cache in the runner __init__).
+        from foundry.integration.sglang.decode_buffers_ops import (
+            rebind_decode_binaries_inplace,
+        )
+
+        _rebind_backed = rebind_decode_binaries_inplace(registry, paths)
     t0 = time.perf_counter()
-    pending = FoundryCUDAGraph.start_graph_builds(
-        paths, num_threads=int(os.environ.get("FOUNDRY_GRAPH_LOAD_THREADS", "4"))
-    )
-    results = FoundryCUDAGraph.finish_graph_loads(pending)
+    try:
+        pending = FoundryCUDAGraph.start_graph_builds(
+            paths, num_threads=int(os.environ.get("FOUNDRY_GRAPH_LOAD_THREADS", "4"))
+        )
+        results = FoundryCUDAGraph.finish_graph_loads(pending)
+    finally:
+        if _rebind_backed and os.environ.get("FOUNDRY_DECODE_NO_RESTORE") != "1":
+            from foundry.integration.sglang.decode_buffers_ops import (
+                restore_decode_binaries,
+            )
+
+            restore_decode_binaries(_rebind_backed)
     logger.info(
         "[Foundry] Loaded %d SGLang graphs in %.3fs (v3)",
         len(results),

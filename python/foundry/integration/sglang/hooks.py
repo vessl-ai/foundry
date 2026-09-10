@@ -136,6 +136,10 @@ def install_hooks(server_args) -> None:
 
         install_bcg_save_hooks()
         install_bcg_load_hooks()
+
+        from foundry.integration.sglang.decode_buffers_ops import install_replay_probe
+
+        install_replay_probe()
     _patch_spawn_sites()
 
     _INSTALLED = True
@@ -308,6 +312,8 @@ def _patch_cuda_graph_capture_v3() -> None:
         if mode == CUDAGraphExtensionMode.NONE:
             return orig_capture(self)
 
+        from foundry.integration.sglang import decode_buffers_ops as dbo
+
         if mode == CUDAGraphExtensionMode.LOAD:
             rt.log_alloc_offset("before_preallocate")
             rt.preallocate_for_load_mode()
@@ -325,6 +331,8 @@ def _patch_cuda_graph_capture_v3() -> None:
             save_graph_manifest()
             pack_fatbins()
             rt.capture_final_alloc_offset()
+            if dbo.enabled() and getattr(self, "buffer_registry", None) is not None:
+                dbo.record_registry_slots(self.buffer_registry)
             return result
 
         # LOAD: restore every archived graph and slot into the backend maps.
@@ -337,10 +345,52 @@ def _patch_cuda_graph_capture_v3() -> None:
         from foundry.integration.sglang.graph_ops import load_all_graphs_v3
 
         backend = self.backend
-        load_all_graphs_v3(backend, list(_v3_load_keys))
+        registry = getattr(self, "buffer_registry", None) if dbo.enabled() else None
+        load_all_graphs_v3(backend, list(_v3_load_keys), registry=registry)
         rt.log_alloc_offset("after_load_all_graphs")
         return result
 
+    orig_runner_init = runner_cls.__init__
+    _decode_mempools: list = []
+
+    @functools.wraps(orig_runner_init)
+    def patched_runner_init(self, *args, **kwargs):
+        # The decode runner's static buffers (registry input slots + the
+        # attention/mamba metadata the decode graph reads) are sub-allocated by
+        # the torch caching allocator *within* foundry's VMM region.  Their
+        # virtual address depends on the allocator's free-segment history, which
+        # differs between SAVE (prefill was *captured*, leaving occupied/free
+        # scratch) and LOAD (prefill was BCG-*loaded* via raw VMM mapping that
+        # torch's free-list never sees).  So on LOAD torch first-fits these
+        # buffers into a low hole that was occupied on SAVE → tens of GB drift →
+        # the restored decode graph reads stale addresses (garbage).  foundry's
+        # own bump cursor is identical across SAVE/LOAD; the drift is purely
+        # torch sub-allocation placement.
+        #
+        # Fix: run the whole decode-runner init inside a *fresh* torch MemPool.
+        # A new pool has no free-list history, so every allocation bumps from
+        # the pool's first segment (taken at the identical foundry cursor) in
+        # the same order on both paths → identical addresses → the baked graph
+        # stays valid.  The pool is kept alive for the process (the buffers must
+        # outlive it).  Gated; empty_cache path kept as a diagnostic.
+        mode = get_graph_extension_mode()
+        if mode != CUDAGraphExtensionMode.NONE:
+            import torch
+
+            if os.environ.get("FOUNDRY_DECODE_MEMPOOL", "1") == "1":
+                torch.cuda.synchronize()
+                pool = torch.cuda.MemPool()
+                _decode_mempools.append(pool)  # process-lifetime; never freed
+                rt.log_alloc_offset("before_decode_runner_init_mempool")
+                with torch.cuda.use_mem_pool(pool):
+                    return orig_runner_init(self, *args, **kwargs)
+            if os.environ.get("FOUNDRY_DECODE_EMPTY_CACHE", "0") == "1":
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                rt.log_alloc_offset("before_decode_runner_init_empty_cache")
+        return orig_runner_init(self, *args, **kwargs)
+
+    runner_cls.__init__ = patched_runner_init
     backend_cls.capture_one = patched_capture_one
     runner_cls.capture = patched_capture
 
