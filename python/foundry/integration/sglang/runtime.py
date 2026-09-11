@@ -58,6 +58,33 @@ class CUDAGraphExtensionState:
 
 _state: CUDAGraphExtensionState | None = None
 _final_alloc_offset: int = 0
+_draft_bypass_depth: int = 0
+
+
+def draft_bypass_active() -> bool:
+    """True while a speculative *draft* model runner is being initialised.
+
+    Draft runners (``model_runner.is_draft_worker``, e.g. the DSPARK/EAGLE
+    draft model) are excluded from graph caching: their decode graphs are
+    cheap to capture (~1 s) and their forward output carries no
+    ``next_token_logits`` to archive.  While active, every class-level capture
+    hook defers to the upstream implementation.
+    """
+    return _draft_bypass_depth > 0
+
+
+class draft_bypass:
+    """Context manager marking a draft-runner initialisation window."""
+
+    def __enter__(self):
+        global _draft_bypass_depth
+        _draft_bypass_depth += 1
+        return self
+
+    def __exit__(self, *exc):
+        global _draft_bypass_depth
+        _draft_bypass_depth -= 1
+        return False
 
 
 def get_state() -> CUDAGraphExtensionState | None:
@@ -449,3 +476,38 @@ def setup_ld_preload_env() -> None:
     if mode != CUDAGraphExtensionMode.NONE:
         os.environ["FOUNDRY_MODE"] = mode.value
     os.environ["FOUNDRY_SPAWN_T0_NS"] = str(time.perf_counter_ns())
+
+
+def check_no_nccl_in_cached_graphs(workspace_dir: str, tag: str = "") -> None:
+    """With FOUNDRY_NCCL_OUTSIDE_REGION=1 (opt-in), NCCL's internal buffers
+    live outside the deterministic region so NCCL keeps its P2P/IPC transport.
+    That is only valid while no NCCL kernel is baked into a cached graph: a
+    restored graph would reference the SAVE process's NCCL device state.
+    Refuse the archive (raise at SAVE) if one is found."""
+    if os.environ.get("FOUNDRY_NCCL_OUTSIDE_REGION", "0") != "1":
+        return
+    import glob
+
+    hits = []
+    for f in glob.glob(os.path.join(workspace_dir, "*.json")):
+        base = os.path.basename(f)
+        if not (base.startswith("bcg_") or base.startswith("graph_")):
+            continue
+        try:
+            with open(f, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        if b"ncclDevKernel" in data or b"ncclKernel" in data:
+            hits.append(base)
+            if len(hits) >= 5:
+                break
+    if hits:
+        logger.error(
+            "[Foundry] NCCL kernels captured into cached graphs (%s) while "
+            "FOUNDRY_NCCL_OUTSIDE_REGION is on: restored graphs would read the "
+            "SAVE process's NCCL state. Re-run SAVE with FOUNDRY_NCCL_OUTSIDE_REGION=0.",
+            hits,
+        )
+        raise RuntimeError("foundry: NCCL kernel in cached graph with NCCL outside region")
+    logger.info("[Foundry] cached graphs contain no NCCL kernels%s", f" ({tag})" if tag else "")

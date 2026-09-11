@@ -32,6 +32,14 @@ from typing import Any
 import torch
 
 from foundry.graph import CUDAGraph as FoundryCUDAGraph
+
+
+def _draft_bypass() -> bool:
+    """See runtime.draft_bypass_active(): draft model runners are not cached."""
+    from foundry.integration.sglang import runtime as rt
+
+    return rt.draft_bypass_active()
+
 from foundry.integration.sglang.config import (
     CUDAGraphExtensionMode,
     get_config,
@@ -162,7 +170,7 @@ def install_bcg_save_hooks() -> None:
     @functools.wraps(orig_capture_one)
     def patched_capture_one(self, shape_key, forward_fn, *args, **kwargs):
         global _ctx
-        if get_graph_extension_mode() != CUDAGraphExtensionMode.SAVE:
+        if get_graph_extension_mode() != CUDAGraphExtensionMode.SAVE or _draft_bypass():
             return orig_capture_one(self, shape_key, forward_fn, *args, **kwargs)
         _ctx = {"size": shape_key.size, "seg": 0, "save_time": 0.0}
         _record_forward_closure(shape_key.size, forward_fn)
@@ -415,6 +423,16 @@ def record_shared_buffer_metadata(backend, shape_key, stored) -> None:
         "buffer": _leaf_metas(buf),
         "output": _leaf_metas(stored),
     }
+    # Preserve the nesting of the captured output so LOAD hands the tail the
+    # same shape SGLang produced at SAVE (e.g. DSPARK targets return
+    # ``(hidden_states, [aux_hidden_states...])``; a flat tensor list breaks
+    # the model's 2-tuple unpack).  Specs are best-effort: exotic containers
+    # fall back to the legacy flat form.
+    try:
+        meta["buffer_spec"] = _struct_spec(buf)
+        meta["output_spec"] = _struct_spec(stored)
+    except TypeError as exc:
+        logger.warning("[Foundry] BCG output structure not archived: %s", exc)
     path = os.path.join(
         _workspace_dir(), f"bcg_{shape_key.size}_out.json"
     )
@@ -520,7 +538,8 @@ def _wrap_break_checksums(graph, size: int) -> None:
     """FOUNDRY_BCG_SUM=1: print a checksum of each break's first tensor input
     before running it, on both SAVE and LOAD replay — diffing the two logs
     pinpoints the first layer whose activations diverge."""
-    if os.environ.get("FOUNDRY_BCG_SUM") != "1":
+    _sum_mode = os.environ.get("FOUNDRY_BCG_SUM")
+    if _sum_mode not in ("1", "2"):
         return
     import json
 
@@ -532,15 +551,74 @@ def _wrap_break_checksums(graph, size: int) -> None:
         tensors = _rebuild_from_meta(bmeta["args"])
         probe = tensors[0] if tensors else None
 
-        def wrapped(fn=fn, probe=probe, i=i):
-            if probe is not None and (
+        def wrapped(fn=fn, probe=probe, i=i, tensors=tensors):
+            rank0 = (
                 not torch.distributed.is_initialized()
                 or torch.distributed.get_rank() == 0
-            ):
+            )
+            if probe is not None and rank0:
                 torch.cuda.synchronize()
                 s = probe.float().abs().sum().item()
                 print(f"[BCG-SUM] size={size} break={i} in={s:.6e}", flush=True)
-            return fn()
+            if _sum_mode == "2" and i == 0:
+                torch.cuda.synchronize()
+                _check_ep_map_watch(f"size={size}")
+            if (
+                i == 0
+                and rank0
+                and os.environ.get("FOUNDRY_MEMSNAP") == "1"
+                and "memsnap" not in _dumped
+            ):
+                import pickle
+
+                _dumped.add("memsnap")
+                torch.cuda.synchronize()
+                snap = torch.cuda.memory._snapshot()
+                _mode = get_graph_extension_mode().value
+                with open(f"/work/logs/memsnap_{_mode}.pickle", "wb") as f:
+                    pickle.dump(snap, f)
+                print(f"[MEMSNAP] dumped {_mode} size={size}", flush=True)
+            _dump_keys = os.environ.get("FOUNDRY_BCG_DUMP", "")
+            _dk = f"{size}:{i}"
+            _allr = os.environ.get("FOUNDRY_BCG_DUMP_ALLRANKS") == "1"
+            _rkid = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            _do_dump = (rank0 or _allr) and _dk in _dump_keys.split(",") and _dk not in _dumped
+            if _do_dump:
+                torch.cuda.synchronize()
+                _pre = [t.detach().clone().cpu() for t in tensors]
+            r = fn()
+            _pd = os.environ.get("FOUNDRY_BCG_PTRDUMP", "")
+            if (rank0 or _allr) and _pd and _pd.split(":")[0] + ":" + _pd.split(":")[1] == _dk and ("ptr" + _dk) not in _dumped:
+                import json as _j
+
+                from foundry import ops as _fops
+
+                _dumped.add("ptr" + _dk)
+                torch.cuda.synchronize()
+                _plist = _j.load(open(_pd.split(":", 2)[2]))
+                _blob = {}
+                for _e in _plist:
+                    try:
+                        _t = _fops.tensor_from_ptr(_e["ptr"], [262144], [1], torch.uint8, torch.cuda.current_device())
+                        _blob[_e["ptr"]] = _t.clone().cpu()
+                    except Exception as _exc:  # peer-device IPC buffers etc.
+                        _blob[_e["ptr"]] = str(_exc)[:80]
+                torch.save(_blob, f"/work/logs/ptrdump_{get_graph_extension_mode().value}_{_dk.replace(':', '_')}" + (f"_r{_rkid}" if _allr else "") + ".pt")
+                print(f"[PTRDUMP] {_dk} {len(_blob)} ptrs", flush=True)
+            if _do_dump:
+                torch.cuda.synchronize()
+                _post = [t.detach().clone().cpu() for t in tensors]
+                _dumped.add(_dk)
+                _mode = get_graph_extension_mode().value
+                torch.save(
+                    {"pre": _pre, "post": _post},
+                    f"/work/logs/bcgdump_{_mode}_{size}_{i}" + (f"_r{_rkid}" if _allr else "") + ".pt",
+                )
+            if _sum_mode == "2" and rank0:
+                torch.cuda.synchronize()
+                outs = " ".join(f"{t.float().abs().sum().item():.6e}" for t in tensors)
+                print(f"[BCG-SUM-OUT] size={size} break={i} args={outs}", flush=True)
+            return r
 
         graph._break_fns[i] = wrapped
 
@@ -554,6 +632,163 @@ def _iter_moe_dispatchers(model):
         disp = getattr(module, "dispatcher", None)
         if disp is not None and hasattr(disp, "local_expert_mapping"):
             yield name, disp
+
+
+def _region_bounds():
+    from foundry.integration.sglang import runtime as rt
+    from foundry.allocation_region import parse_size
+
+    cfg = rt.get_config()
+    base = int(cfg.base_addr)
+    return base, base + parse_size(cfg.region_size)
+
+
+def _ensure_ep_dispatcher_maps_in_region(model) -> None:
+    """SAVE (before capture): create every dispatcher's ``local_expert_mapping``
+    *now*, on this thread, inside foundry's deterministic region.
+
+    SGLang builds the mapping lazily on the first EP dispatch.  In the
+    production tree that first dispatch can happen in a context whose
+    allocations are not redirected into the region (observed: Solar-Pro-4
+    W4AFP8 tp2/ep2 + DSPARK, mapping at 0x7af9... while the region is
+    0x6000...), so the archived address is meaningless in the LOAD process
+    and ``_restore_ep_dispatcher_maps`` fails with "pointer resides on host
+    memory".  Pre-creating the (tiny, content-deterministic) mapping here
+    makes SGLang skip its lazy path, so the captured graphs bake an in-region
+    address that LOAD can rebuild."""
+    lo, hi = _region_bounds()
+    created = replaced = 0
+    if os.environ.get("FOUNDRY_EP_MAP_DEBUG") == "1":
+        _rk = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        for _k, (name, disp) in enumerate(_iter_moe_dispatchers(model)):
+            if _k < 3 or _k in (13, 47):
+                logger.info(
+                    "[Foundry] EPMAP-DEBUG rank=%d %s num_experts=%s local=%s routed=%s shared=%s ep_rank=%s ep_size=%s skip=%s has_map=%s",
+                    _rk, name, disp.num_experts, getattr(disp, "num_local_experts", None),
+                    disp.num_local_routed_experts, disp.num_local_shared_experts,
+                    disp.moe_ep_rank, getattr(disp, "moe_ep_size", None),
+                    getattr(disp, "skip_local_expert_mapping", None),
+                    disp.local_expert_mapping is not None,
+                )
+    for name, disp in _iter_moe_dispatchers(model):
+        if getattr(disp, "moe_ep_size", 1) <= 1 or getattr(
+            disp, "skip_local_expert_mapping", False
+        ):
+            continue
+        old = disp.local_expert_mapping
+        if old is not None and lo <= old.data_ptr() < hi:
+            continue
+        n_routed = disp.num_local_routed_experts
+        n_shared = disp.num_local_shared_experts
+        dev = torch.cuda.current_device()
+        new = torch.full((disp.num_experts,), -1, dtype=torch.int32, device=dev)
+        start = disp.moe_ep_rank * n_routed
+        new[start : start + n_routed] = torch.arange(
+            0, n_routed, dtype=torch.int32, device=dev
+        )
+        if n_shared > 0:
+            new[-n_shared:] = torch.arange(
+                n_routed, n_routed + n_shared, dtype=torch.int32, device=dev
+            )
+        if not (lo <= new.data_ptr() < hi):
+            raise RuntimeError(
+                f"[Foundry] EP dispatcher map for {name} allocated outside the "
+                f"region: {new.data_ptr():#x} not in [{lo:#x}, {hi:#x})"
+            )
+        if old is not None:
+            if not torch.equal(old.to(new.device), new):
+                logger.warning(
+                    "[Foundry] EP dispatcher map content differs from SGLang's "
+                    "lazily built one at %s; keeping SGLang's values", name
+                )
+                new.copy_(old.to(new.device))
+            replaced += 1
+        else:
+            created += 1
+        disp.local_expert_mapping = new
+    if created or replaced:
+        logger.info(
+            "[Foundry] EP dispatcher maps pre-created in region "
+            "(created=%d, replaced=%d, first=%s)",
+            created, replaced,
+            next((hex(d.local_expert_mapping.data_ptr()) for _, d in _iter_moe_dispatchers(model) if d.local_expert_mapping is not None), None),
+        )
+
+
+def _prebuild_multimem_gatherers(model) -> None:
+    """Build SGLang's lazily-created multimem logits all-gather state *now*
+    (before prefill capture), identically on SAVE and LOAD.
+
+    ``MultimemAllGatherer`` builds its symmetric-memory buffer on the first
+    *eager* call.  Upstream that happens in the decode-capture warmup
+    forwards; foundry SAVE skips those warmups and LOAD skips capture, and on
+    LOAD the build inside the decode runner's private MemPool fails
+    ("CUDA driver error: invalid argument").  Either way the decode graphs
+    bake the NCCL ring all-gather fallback (~0.4 ms per step vs a few us) —
+    measured as -3.5%% conc-8 throughput on Solar-Pro-4 W4AFP8 + DSPARK.
+
+    Building here — same point, same order on both paths, before LOAD's region
+    preallocation — lets SAVE capture the multimem kernel and gives LOAD the
+    same symmetric-memory addresses (verified against the archive)."""
+    if os.environ.get("FOUNDRY_PREBUILD_MULTIMEM", "1") != "1":
+        return
+    try:
+        from sglang.srt.distributed.device_communicators import (
+            triton_symm_mem_ag as ag,
+        )
+    except Exception:
+        return
+    import json as _json
+
+    lm = getattr(model, "lm_head", None)
+    w = getattr(lm, "weight", None)
+    if w is None:
+        return
+    rec = {}
+    for name, mod in model.named_modules():
+        g = getattr(mod, "_logits_gatherer", None)
+        if not isinstance(g, ag.MultimemAllGatherer):
+            continue
+        if g._state is not ag.MultimemAllGatherer._UNINIT:
+            continue
+        x = torch.empty((1, w.shape[0]), dtype=torch.bfloat16, device=w.device)
+        st = g._build(x)
+        del x
+        if st is g._UNINIT:
+            continue
+        g._state = st
+        if st is None:
+            rec[name] = None
+            continue
+        h = st.symm_mem_hdl
+        rec[name] = {
+            "comm_buff": st.comm_buff.data_ptr(),
+            "buffer_ptrs": list(h.buffer_ptrs),
+            "signal_pad_ptrs": list(h.signal_pad_ptrs),
+            "buffer_ptrs_dev": int(h.buffer_ptrs_dev),
+            "signal_pad_ptrs_dev": int(h.signal_pad_ptrs_dev),
+            "multicast_ptr": int(h.multicast_ptr),
+        }
+    if not rec:
+        return
+    path = os.path.join(_workspace_dir(), "multimem_state.json")
+    mode = get_graph_extension_mode()
+    if mode == CUDAGraphExtensionMode.SAVE:
+        with open(path, "w") as f:
+            _json.dump(rec, f)
+        logger.info("[Foundry] multimem all-gather prebuilt (%d): %s", len(rec),
+                    {k: (hex(v["comm_buff"]) if v else None) for k, v in rec.items()})
+    elif mode == CUDAGraphExtensionMode.LOAD and os.path.exists(path):
+        ref = _json.load(open(path))
+        if ref == rec:
+            logger.info("[Foundry] multimem all-gather prebuilt: addresses match SAVE (%d)", len(rec))
+        else:
+            logger.error(
+                "[Foundry] multimem all-gather state DIFFERS from SAVE — restored "
+                "decode graphs would read wrong symmetric memory: save=%s load=%s",
+                ref, rec,
+            )
+            raise RuntimeError("foundry: multimem all-gather state mismatch vs archive")
 
 
 def _record_ep_dispatcher_maps(model) -> None:
@@ -570,7 +805,15 @@ def _record_ep_dispatcher_maps(model) -> None:
             digest = hashlib.sha1(
                 t.detach().contiguous().cpu().numpy().tobytes()
             ).hexdigest()[:16]
-            out[name] = {"ptr": t.data_ptr(), "numel": t.numel(), "hash": digest}
+            out[name] = {
+                "ptr": t.data_ptr(),
+                "numel": t.numel(),
+                "hash": digest,
+                # Verbatim contents: LOAD restores these instead of
+                # re-deriving the mapping (the derivation drifted from
+                # SGLang's own on the production tree — content mismatch).
+                "values": t.detach().cpu().tolist(),
+            }
     if out:
         with open(_ep_dispatcher_map_path(), "w") as f:
             _json.dump(out, f)
@@ -578,10 +821,21 @@ def _record_ep_dispatcher_maps(model) -> None:
 
 
 def _restore_ep_dispatcher_maps(model) -> None:
-    """LOAD (before replay): the mapping is lazily built during warmup, which
-    LOAD skips entirely — the captured graphs would read unwritten memory and
-    silently route every token to the wrong expert.  Rebuild the mapping at
-    the archived address and hand it to the dispatcher."""
+    """LOAD (before replay): make every dispatcher's ``local_expert_mapping``
+    live at its archived address with its archived contents.
+
+    The maps are small torch allocations made (SAVE) just before prefill
+    capture, from the default caching-allocator pool.  Viewing the archived
+    address with ``tensor_from_ptr`` is NOT enough: the LOAD process's
+    allocator still considers that block free and later hands it to other
+    tensors (draft-model init, runtime temporaries), which silently overwrite
+    the routing table the captured graphs read — every MoE layer then routes
+    part of the tokens to wrong experts (observed: garbage on the W4AFP8 +
+    DSPARK production tree).  So LOAD re-runs the exact SAVE allocation
+    (``_ensure_ep_dispatcher_maps_in_region`` at the same point in the same
+    order, before region preallocation) and only verifies the address; the
+    torch-owned tensor keeps the block reserved.  A raw view is kept only as
+    a logged fallback."""
     import json as _json
 
     from foundry import ops as foundry_ops
@@ -590,28 +844,50 @@ def _restore_ep_dispatcher_maps(model) -> None:
     path = _ep_dispatcher_map_path()
     if not os.path.exists(path):
         return
-    rt.preallocate_for_load_mode()
     ref = _json.load(open(path))
-    restored = 0
+    if os.environ.get("FOUNDRY_EP_MAP_SYMMETRIC", "1") == "1":
+        _ensure_ep_dispatcher_maps_in_region(model)
+    rt.preallocate_for_load_mode()
+    restored = owned = 0
+    fallback = []
     for name, disp in _iter_moe_dispatchers(model):
         meta = ref.get(name)
         if meta is None:
             continue
-        t = foundry_ops.tensor_from_ptr(
-            meta["ptr"], [meta["numel"]], [1], torch.int32,
-            torch.cuda.current_device(),
-        )
-        t.fill_(-1)
-        n_routed = disp.num_local_routed_experts
-        start = disp.moe_ep_rank * n_routed
-        t[start : start + n_routed] = torch.arange(
-            0, n_routed, dtype=torch.int32, device=t.device
-        )
-        n_shared = disp.num_local_shared_experts
-        if n_shared > 0:
-            t[-n_shared:] = torch.arange(
-                n_routed, n_routed + n_shared, dtype=torch.int32, device=t.device
+        live = disp.local_expert_mapping
+        if live is not None and live.data_ptr() == meta["ptr"] and live.numel() == meta["numel"]:
+            t = live
+            owned += 1
+        else:
+            fallback.append(
+                (name, hex(meta["ptr"]), hex(live.data_ptr()) if live is not None else None)
             )
+            t = foundry_ops.tensor_from_ptr(
+                meta["ptr"], [meta["numel"]], [1], torch.int32,
+                torch.cuda.current_device(),
+            )
+        if meta.get("values") is not None:
+            if t is live and os.environ.get("FOUNDRY_EP_MAP_DEBUG") == "1":
+                _cur = t.detach().cpu().tolist()
+                _nd = sum(1 for _x, _y in zip(_cur, meta["values"]) if _x != _y)
+                if _nd:
+                    logger.warning(
+                        "[Foundry] EPMAP-DEBUG %s: LOAD-derived map differs from SAVE in %d/%d entries",
+                        name, _nd, len(_cur),
+                    )
+            t.copy_(torch.tensor(meta["values"], dtype=torch.int32, device=t.device))
+        else:
+            t.fill_(-1)
+            n_routed = disp.num_local_routed_experts
+            start = disp.moe_ep_rank * n_routed
+            t[start : start + n_routed] = torch.arange(
+                0, n_routed, dtype=torch.int32, device=t.device
+            )
+            n_shared = disp.num_local_shared_experts
+            if n_shared > 0:
+                t[-n_shared:] = torch.arange(
+                    n_routed, n_routed + n_shared, dtype=torch.int32, device=t.device
+                )
         disp.local_expert_mapping = t
         restored += 1
         if "hash" in meta:
@@ -625,8 +901,36 @@ def _restore_ep_dispatcher_maps(model) -> None:
                     "[Foundry] EP dispatcher map content mismatch at %s: "
                     "save=%s load=%s", name, meta["hash"], digest,
                 )
+    if fallback:
+        logger.warning(
+            "[Foundry] EP dispatcher maps NOT allocator-owned at archived address "
+            "(%d/%d; raw view fallback, may be overwritten): first=%s",
+            len(fallback), restored, fallback[:3],
+        )
     if restored:
-        logger.info("[Foundry] EP dispatcher maps restored (%d layers)", restored)
+        logger.info(
+            "[Foundry] EP dispatcher maps restored (%d layers, %d allocator-owned)",
+            restored, owned,
+        )
+    global _ep_map_watch
+    _ep_map_watch = [
+        (name, disp.local_expert_mapping, ref[name].get("values"))
+        for name, disp in _iter_moe_dispatchers(model)
+        if name in ref and ref[name].get("values") is not None
+    ][:2]
+
+
+_ep_map_watch: list = []
+_dumped: set = set()
+
+
+def _check_ep_map_watch(tag: str) -> None:
+    """FOUNDRY_BCG_SUM=2 diagnostic: detect later overwrites of the maps."""
+    for name, t, values in _ep_map_watch:
+        cur = t.detach().cpu().tolist()
+        if cur != values:
+            bad = sum(1 for a, b in zip(cur, values) if a != b)
+            print(f"[EP-MAP-CLOBBERED] {tag} {name} {bad}/{len(values)} entries differ", flush=True)
 
 
 def _install_param_map_probe() -> None:
@@ -651,12 +955,58 @@ def _install_param_map_probe() -> None:
             model = self.model_runner.model
             snap = {n: t.data_ptr() for n, t in model.named_parameters()}
             snap.update({"buf:" + n: t.data_ptr() for n, t in model.named_buffers()})
+            # Plain tensor attributes (not registered as parameter/buffer) —
+            # e.g. Marlin ``layer.workspace``, dispatcher maps — are read by
+            # captured kernels at their SAVE-time address too.
+            _seen = {id(t) for _, t in model.named_parameters()} | {
+                id(t) for _, t in model.named_buffers()
+            }
+            for mn, mod in model.named_modules():
+                for holder_name, holder in (("", mod), (".dispatcher", getattr(mod, "dispatcher", None))):
+                    if holder is None:
+                        continue
+                    for an, av in list(vars(holder).items()):
+                        if isinstance(av, torch.Tensor) and av.is_cuda and id(av) not in _seen:
+                            key = f"attr:{mn}{holder_name}.{an}"
+                            snap[key] = av.data_ptr()
+                            if 0 < av.numel() * av.element_size() <= (1 << 20):
+                                raw = av.detach().contiguous().cpu().view(torch.uint8)
+                                snap["hash:" + key] = hashlib.sha1(bytes(raw.numpy().tobytes())).hexdigest()[:16]
             # Content hashes for small buffers — restored graphs read them at
             # captured addresses, so stale contents silently corrupt compute.
             for n, t in model.named_buffers():
                 if 0 < t.numel() * t.element_size() <= (1 << 20):
                     raw = t.detach().contiguous().cpu().view(torch.uint8)
                     snap["hash:" + n] = hashlib.sha1(bytes(raw.numpy().tobytes())).hexdigest()[:16]
+            # Memory-pool tensors (KV / mamba / req_to_token) — captured
+            # segments may read them at baked addresses.
+            def _walk_pool(obj, prefix, depth, seen_ids):
+                if depth > 4 or obj is None or id(obj) in seen_ids:
+                    return
+                seen_ids.add(id(obj))
+                if isinstance(obj, torch.Tensor):
+                    if obj.is_cuda:
+                        snap[prefix] = obj.data_ptr()
+                    return
+                if isinstance(obj, (list, tuple)):
+                    for k, v in enumerate(obj[:512]):
+                        _walk_pool(v, f"{prefix}[{k}]", depth + 1, seen_ids)
+                    return
+                if isinstance(obj, dict):
+                    for k, v in list(obj.items())[:512]:
+                        _walk_pool(v, f"{prefix}[{k!r}]", depth + 1, seen_ids)
+                    return
+                if hasattr(obj, "__dict__") and not isinstance(obj, torch.nn.Module):
+                    for k, v in list(vars(obj).items()):
+                        if isinstance(v, (torch.Tensor, list, tuple, dict)) or (
+                            hasattr(v, "__dict__") and type(v).__module__.startswith("sglang")
+                        ):
+                            _walk_pool(v, f"{prefix}.{k}", depth + 1, seen_ids)
+
+            _mr = self.model_runner
+            _pseen: set = set()
+            for _pn in ("token_to_kv_pool", "req_to_token_pool", "token_to_kv_pool_allocator"):
+                _walk_pool(getattr(_mr, _pn, None), f"pool:{_pn}", 0, _pseen)
             path = os.path.join(_workspace_dir(), "model_ptr_map.json")
             if mode == CUDAGraphExtensionMode.SAVE:
                 with open(path, "w") as f:
@@ -665,10 +1015,17 @@ def _install_param_map_probe() -> None:
             elif mode == CUDAGraphExtensionMode.LOAD and os.path.exists(path):
                 ref = _json.load(open(path))
                 moved = [
-                    (n, hex(ref[n]), hex(snap.get(n, 0)))
+                    (n, ref[n] if n.startswith("hash:") else hex(ref[n]),
+                     snap.get(n, 0) if n.startswith("hash:") else hex(snap.get(n, 0)))
                     for n in ref
                     if snap.get(n) != ref[n]
                 ]
+                attr_n = sum(1 for n in ref if n.startswith("attr:"))
+                pool_n = sum(1 for n in ref if n.startswith("pool:"))
+                logger.info(
+                    "[Foundry] model ptr probe: %d attr + %d pool tensors compared",
+                    attr_n, pool_n,
+                )
                 if moved:
                     logger.warning(
                         "[Foundry] model ptr drift: %d/%d tensors moved; first=%s",
@@ -680,11 +1037,19 @@ def _install_param_map_probe() -> None:
                     )
         except Exception as exc:
             logger.warning("[Foundry] model ptr probe failed: %s", exc)
+        from foundry.integration.sglang import autotune_ops
+
+        if mode in (CUDAGraphExtensionMode.SAVE, CUDAGraphExtensionMode.LOAD):
+            _prebuild_multimem_gatherers(self.model_runner.model)
         if mode == CUDAGraphExtensionMode.LOAD:
+            autotune_ops.load(_workspace_dir())
             _restore_ep_dispatcher_maps(self.model_runner.model)
+        elif mode == CUDAGraphExtensionMode.SAVE:
+            _ensure_ep_dispatcher_maps_in_region(self.model_runner.model)
         result = orig(self, *args, **kwargs)
         if mode == CUDAGraphExtensionMode.SAVE:
             _record_ep_dispatcher_maps(self.model_runner.model)
+            autotune_ops.save(_workspace_dir(), "after prefill capture")
         return result
 
     patched._foundry_param_probe = True
@@ -737,7 +1102,7 @@ def install_bcg_load_hooks() -> None:
     @functools.wraps(orig_capture_one)
     def patched_capture_one(self, shape_key, forward_fn, capture_inputs=None,
                             post_warmup_hook=None):
-        if get_graph_extension_mode() != CUDAGraphExtensionMode.LOAD:
+        if get_graph_extension_mode() != CUDAGraphExtensionMode.LOAD or _draft_bypass():
             return orig_capture_one(self, shape_key, forward_fn, capture_inputs,
                                     post_warmup_hook)
 
@@ -831,9 +1196,15 @@ def install_bcg_load_hooks() -> None:
         # Shared output buffer + per-shape output slice at archived addresses.
         if self._shared_output_buffer is None:
             bufs = _rebuild_from_meta(out_meta["buffer"])
-            self._shared_output_buffer = bufs[0] if len(bufs) == 1 else bufs
+            if out_meta.get("buffer_spec") is not None:
+                self._shared_output_buffer = _build_from_spec(out_meta["buffer_spec"], bufs)
+            else:
+                self._shared_output_buffer = bufs[0] if len(bufs) == 1 else bufs
         outs = _rebuild_from_meta(out_meta["output"])
-        stored = outs[0] if len(outs) == 1 else outs
+        if out_meta.get("output_spec") is not None:
+            stored = _build_from_spec(out_meta["output_spec"], outs)
+        else:
+            stored = outs[0] if len(outs) == 1 else outs
 
         _wrap_break_checksums(graph, size)
         verify_capture_inputs(size, capture_inputs)

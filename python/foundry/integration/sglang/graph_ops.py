@@ -44,28 +44,82 @@ def _graph_filename(index: int, key: Any) -> str:
     return f"graph_{index}_FULL_t{batch_size}_r{batch_size}_UX_pcN.json"
 
 
-def _pack_output(output: Any) -> torch.Tensor:
+# Tensor fields of LogitsProcessorOutput that a captured decode/verify graph
+# may produce.  All present ones are archived (in this order) so LOAD hands the
+# runner the same object shape SAVE did — DSPARK/EAGLE verify reads
+# ``hidden_states`` off the graph output, not only ``next_token_logits``.
+_LPO_TENSOR_FIELDS = (
+    "next_token_logits",
+    "hidden_states",
+    "full_logits",
+    "next_token_logprobs",
+    "input_token_logprobs",
+    "mm_input_embeds",
+    "next_token_logits_buffer",
+)
+_LPO_ENUM_FIELDS = ("forward_mode", "capture_hidden_mode")
+
+
+def _pack_output(output: Any) -> tuple[list[torch.Tensor], dict[str, Any]]:
+    """Flatten a captured graph output into (tensors, descriptor)."""
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
     if isinstance(output, LogitsProcessorOutput):
-        if output.next_token_logits is None:
+        tensors, fields = [], []
+        for f in _LPO_TENSOR_FIELDS:
+            t = getattr(output, f, None)
+            if isinstance(t, torch.Tensor):
+                tensors.append(t)
+                fields.append(f)
+        if "next_token_logits" not in fields:
             raise TypeError("SGLang decode CUDA graph output has no next_token_logits")
-        return output.next_token_logits
+        enums = {}
+        for f in _LPO_ENUM_FIELDS:
+            v = getattr(output, f, None)
+            if v is not None:
+                enums[f] = int(v.value) if hasattr(v, "value") else v
+        return tensors, {"type": "LogitsProcessorOutput", "fields": fields, "enums": enums}
 
     if isinstance(output, torch.Tensor):
-        return output
+        return [output], {"type": "tensor"}
 
     raise TypeError(f"Unsupported SGLang CUDA graph output type: {type(output)!r}")
 
 
-def _unpack_output(tensors: Any) -> Any:
+def _unpack_output(tensors: Any, desc: dict[str, Any] | None = None) -> Any:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
-    if isinstance(tensors, (tuple, list)):
+    if isinstance(tensors, torch.Tensor):
+        tensors = [tensors]
+    tensors = list(tensors)
+    if desc is None:
+        # Legacy archives: a single next_token_logits tensor.
         if len(tensors) != 1:
             raise RuntimeError(f"Expected one SGLang CUDA graph output tensor, got {len(tensors)}")
-        tensors = tensors[0]
-    return LogitsProcessorOutput(next_token_logits=tensors)
+        return LogitsProcessorOutput(next_token_logits=tensors[0])
+    if desc.get("type") == "tensor":
+        return tensors[0]
+    fields = desc["fields"]
+    if len(fields) != len(tensors):
+        raise RuntimeError(
+            f"SGLang CUDA graph output field/tensor mismatch: {fields} vs {len(tensors)} tensors"
+        )
+    out = LogitsProcessorOutput(**dict(zip(fields, tensors)))
+    enums = desc.get("enums") or {}
+    if enums:
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+
+        for f, v in enums.items():
+            try:
+                out_v = {"forward_mode": ForwardMode, "capture_hidden_mode": CaptureHiddenMode}[f](v)
+            except Exception:
+                out_v = v
+            setattr(out, f, out_v)
+    return out
+
+
+def _outdesc_path(workspace_dir: str, index: int) -> str:
+    return os.path.join(workspace_dir, f"outdesc_{index}.json")
 
 
 def _scan_graph_files(workspace_dir: str) -> list[tuple[int, str, dict[str, Any]]]:
@@ -104,10 +158,14 @@ def save_graph(graph, output: Any, key: Any) -> None:
     if cfg is None or state is None or cfg.workspace_dir is None:
         raise RuntimeError("Foundry SGLang graph extension is not initialized")
 
-    packed_output = _pack_output(output)
+    tensors, desc = _pack_output(output)
     filename = _graph_filename(state.capture_index, key)
     graph_path = os.path.join(cfg.workspace_dir, filename)
-    graph.save(graph_path, packed_output)
+    graph.save(graph_path, tensors if len(tensors) > 1 else tensors[0])
+    import json as _json
+
+    with open(_outdesc_path(cfg.workspace_dir, state.capture_index), "w") as f:
+        _json.dump(desc, f)
 
     state.capture_index += 1
     logger.info("[Foundry] Saved SGLang CUDA graph %s key=%s", filename, key)
@@ -467,5 +525,11 @@ def load_all_graphs_v3(backend, shape_keys, registry=None) -> None:
         graph, tensors = results[i]
         shape_key = by_size[meta["key"]]
         backend._graphs[shape_key] = graph
-        backend._outputs[shape_key] = _unpack_output(tensors)
+        desc = None
+        dpath = _outdesc_path(cfg.workspace_dir, _index)
+        if os.path.exists(dpath):
+            import json as _json
+
+            desc = _json.load(open(dpath))
+        backend._outputs[shape_key] = _unpack_output(tensors, desc)
         state.loaded_graphs[meta["key"]] = (graph, backend._outputs[shape_key])

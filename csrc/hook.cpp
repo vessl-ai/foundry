@@ -14,6 +14,7 @@
 #include <chrono>
 #include <set>
 #include <mutex>
+#include <cerrno>
 #include <variant>
 #include <tuple>
 #include <unordered_map>
@@ -2554,6 +2555,26 @@ CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion, cu
   return real_func(symbol, pfn, cudaVersion, flags, symbolStatus);
 }
 
+// NCCL-internal allocations (connection/staging buffers) are allocated
+// outside the deterministic region so NCCL's legacy CUDA IPC (P2P over NVLink)
+// works: region memory is VMM-backed and cuIpcGetMemHandle refuses it, which
+// makes NCCL fall back to its SHM transport (measured: AllGather 0.06 ->
+// 0.40 ms, conc-8 throughput -1.5%% on H200 TP2).  Safe only while no NCCL
+// kernel is baked into a *cached* graph (their devComm/buffers would then be
+// non-deterministic); the SGLang integration checks that at SAVE and refuses
+// the archive otherwise.  FOUNDRY_NCCL_OUTSIDE_REGION=0 restores the old
+// behaviour (everything in-region, NCCL on SHM).
+static bool foundry_caller_is_libnccl(void* ret_addr) {
+  static const bool enabled = []() {
+    const char* v = getenv("FOUNDRY_NCCL_OUTSIDE_REGION");
+    return v != nullptr && strcmp(v, "1") == 0;
+  }();
+  if (!enabled || ret_addr == nullptr) return false;
+  Dl_info info;
+  if (dladdr(ret_addr, &info) == 0 || info.dli_fname == nullptr) return false;
+  return strstr(info.dli_fname, "libnccl") != nullptr;
+}
+
 CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
   FOUNDRY_STAT(stat_mem_alloc);
   FOUNDRY_ALLOC_LOCK();
@@ -2562,6 +2583,13 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
       (cuMemAlloc_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemAlloc_v2);
 
   if (!tls_storage.enabled || !tls_storage.region_initialized) {
+    return real_func(dptr, bytesize);
+  }
+  if (foundry_caller_is_libnccl(__builtin_return_address(0))) {
+    static std::atomic<long> nccl_bypass_n{0};
+    long k = ++nccl_bypass_n;
+    if (k <= 3 || (k & (k - 1)) == 0)
+      fprintf(stderr, "[HOOK] NCCL allocation kept outside region (#%ld, size=%zu)\n", k, bytesize);
     return real_func(dptr, bytesize);
   }
 
@@ -3207,6 +3235,75 @@ void* dlsym(void* handle, const char* symbol) {
 static constexpr uint32_t VMM_IPC_MAGIC = 0x564D4D49;  // "VMMI"
 
 // Hook for cuIpcGetMemHandle - intercept Driver API to support VMM allocations
+// ---------------------------------------------------------------------------
+// VMM IPC v2: cross-process CUDA IPC for region (VMM) memory.
+//
+// Region memory is cuMemCreate-backed, so legacy cuIpcGetMemHandle fails and
+// NCCL falls back to its SHM transport (measured on H200 TP2: AllGather
+// 0.06 -> 0.40 ms, long-prompt TTFT +40%).  Keeping NCCL's own buffers in the
+// region is still required: cached graphs bake NCCL kernels whose devComm must
+// sit at the same address on LOAD.  v2 exports the POSIX fd of the backing
+// physical allocation (+ offset); the importer duplicates it from the
+// exporter with pidfd_getfd (needs CAP_SYS_PTRACE or yama ptrace_scope=0 --
+// production pods add SYS_PTRACE) and maps it at a *driver-chosen VA outside
+// the region*.  Peer VAs only live in NCCL's runtime device state, never in
+// captured kernel params, so they need not be deterministic, and keeping them
+// out of the region leaves the deterministic cursor untouched.
+// FOUNDRY_VMM_IPC=0 restores the old refusal (NCCL on SHM).
+// ---------------------------------------------------------------------------
+#include <sys/syscall.h>
+static constexpr uint32_t VMM_IPC_MAGIC_V2 = 0x324D4D56;  // "VMM2"
+
+static bool foundry_vmm_ipc_permitted() {
+  static int cached = -1;
+  if (cached >= 0) return cached == 1;
+  const char* v = getenv("FOUNDRY_VMM_IPC");
+  if (v && strcmp(v, "0") == 0) {
+    cached = 0;
+    return false;
+  }
+  bool cap = false;
+  if (FILE* f = fopen("/proc/self/status", "r")) {
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+      if (strncmp(line, "CapEff:", 7) == 0) {
+        unsigned long long c = strtoull(line + 7, nullptr, 16);
+        cap = ((c >> 19) & 1ULL) != 0;  // CAP_SYS_PTRACE
+      }
+    }
+    fclose(f);
+  }
+  int scope = 0;
+  if (FILE* f = fopen("/proc/sys/kernel/yama/ptrace_scope", "r")) {
+    if (fscanf(f, "%d", &scope) != 1) scope = 1;
+    fclose(f);
+  }
+  bool ok = (scope == 0) || (cap && scope <= 2);
+  cached = ok ? 1 : 0;
+  fprintf(stderr, "[HOOK] VMM IPC v2 %s (CAP_SYS_PTRACE=%d ptrace_scope=%d)\n",
+          ok ? "enabled" : "disabled", (int)cap, scope);
+  return ok;
+}
+
+static std::mutex g_vmm_ipc_mu;
+static std::unordered_map<CUmemGenericAllocationHandle, int> g_vmm_export_fds;  // handle -> fd
+struct VmmImportKey {
+  int pid;
+  int fd;
+  bool operator==(const VmmImportKey& o) const { return pid == o.pid && fd == o.fd; }
+};
+struct VmmImportKeyHash {
+  size_t operator()(const VmmImportKey& k) const {
+    return std::hash<long long>()(((long long)k.pid << 32) ^ (unsigned)k.fd);
+  }
+};
+static std::unordered_map<VmmImportKey, CUmemGenericAllocationHandle, VmmImportKeyHash>
+    g_vmm_import_handles;
+struct VmmImportMapping {
+  size_t map_size;
+};
+static std::unordered_map<CUdeviceptr, VmmImportMapping> g_vmm_import_maps;  // va -> mapping
+
 CUresult cuIpcGetMemHandle(CUipcMemHandle* pHandle, CUdeviceptr dptr) {
   typedef CUresult (*cuIpcGetMemHandle_t)(CUipcMemHandle*, CUdeviceptr);
   auto real_func =
@@ -3221,6 +3318,59 @@ CUresult cuIpcGetMemHandle(CUipcMemHandle* pHandle, CUdeviceptr dptr) {
     metadata = kv.second;
   });
 
+  if (found && foundry_vmm_ipc_permitted() &&
+      (metadata.from_preallocation || metadata.handle != 0)) {
+    CUmemGenericAllocationHandle phys = 0;
+    size_t off = 0;
+    if (metadata.from_preallocation) {
+      phys = tls_storage.preallocated_handle;
+      off = (size_t)(dptr - (CUdeviceptr)tls_storage.preallocated_start_addr);
+    } else {
+      phys = metadata.handle;
+      off = (size_t)(dptr - metadata.ptr);
+    }
+    if (phys != 0) {
+      typedef CUresult (*cuMemExportToShareableHandle_t)(
+          void*, CUmemGenericAllocationHandle, CUmemAllocationHandleType, unsigned long long);
+      auto export_func = (cuMemExportToShareableHandle_t)CUDA_DRIVER_CALL(
+          cuda_driver_entry_table, CUDA_ENTRY_cuMemExportToShareableHandle);
+      int fd = -1;
+      {
+        std::lock_guard<std::mutex> lk(g_vmm_ipc_mu);
+        auto it = g_vmm_export_fds.find(phys);
+        if (it != g_vmm_export_fds.end()) {
+          fd = it->second;
+        } else if (export_func != nullptr) {
+          CUresult r = export_func(&fd, phys, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0);
+          if (r != CUDA_SUCCESS) {
+            fprintf(stderr, "[HOOK] VMM IPC v2: export failed (%d) for ptr=0x%llx\n", (int)r,
+                    (unsigned long long)dptr);
+            fd = -1;
+          } else {
+            g_vmm_export_fds[phys] = fd;  // kept open for the process lifetime
+          }
+        }
+      }
+      if (fd >= 0) {
+        uint32_t magic = VMM_IPC_MAGIC_V2;
+        int pid = (int)getpid();
+        uint64_t off64 = off, size64 = metadata.size;
+        memset(pHandle, 0, sizeof(CUipcMemHandle));
+        memcpy(pHandle->reserved + 0, &magic, 4);
+        memcpy(pHandle->reserved + 4, &pid, 4);
+        memcpy(pHandle->reserved + 8, &fd, 4);
+        memcpy(pHandle->reserved + 16, &off64, 8);
+        memcpy(pHandle->reserved + 24, &size64, 8);
+        static std::atomic<long> n_exp{0};
+        long k = ++n_exp;
+        if (k <= 2 || (k & (k - 1)) == 0)
+          fprintf(stderr, "[HOOK] VMM IPC v2 export #%ld ptr=0x%llx size=%zu off=0x%zx\n", k,
+                  (unsigned long long)dptr, (size_t)size64, off);
+        return CUDA_SUCCESS;
+      }
+    }
+    return CUDA_ERROR_NOT_SUPPORTED;
+  }
   if (found && metadata.handle != 0) {
     // VMM allocation. The legacy shareable-handle scheme below smuggles a
     // POSIX fd through CUipcMemHandle, which cannot cross the process
@@ -3290,6 +3440,95 @@ CUresult cuIpcOpenMemHandle(CUdeviceptr* pdptr, CUipcMemHandle handle, unsigned 
   // Check for our VMM magic marker
   uint32_t magic;
   memcpy(&magic, handle.reserved, sizeof(uint32_t));
+
+  if (magic == VMM_IPC_MAGIC_V2) {
+    int pid = 0, rfd = -1;
+    uint64_t off64 = 0, size64 = 0;
+    memcpy(&pid, handle.reserved + 4, 4);
+    memcpy(&rfd, handle.reserved + 8, 4);
+    memcpy(&off64, handle.reserved + 16, 8);
+    memcpy(&size64, handle.reserved + 24, 8);
+    CUmemGenericAllocationHandle imported = 0;
+    {
+      std::lock_guard<std::mutex> lk(g_vmm_ipc_mu);
+      VmmImportKey key{pid, rfd};
+      auto it = g_vmm_import_handles.find(key);
+      if (it != g_vmm_import_handles.end()) {
+        imported = it->second;
+      } else {
+        int pidfd = (int)syscall(SYS_pidfd_open, pid, 0);
+        if (pidfd < 0) {
+          fprintf(stderr, "[HOOK] VMM IPC v2: pidfd_open(%d) failed errno=%d\n", pid, errno);
+          return CUDA_ERROR_NOT_SUPPORTED;
+        }
+        int lfd = (int)syscall(SYS_pidfd_getfd, pidfd, rfd, 0);
+        close(pidfd);
+        if (lfd < 0) {
+          fprintf(stderr, "[HOOK] VMM IPC v2: pidfd_getfd(pid=%d fd=%d) failed errno=%d\n", pid,
+                  rfd, errno);
+          return CUDA_ERROR_NOT_SUPPORTED;
+        }
+        typedef CUresult (*cuMemImportFromShareableHandle_t)(CUmemGenericAllocationHandle*,
+                                                             void*, CUmemAllocationHandleType);
+        auto import_func = (cuMemImportFromShareableHandle_t)CUDA_DRIVER_CALL(
+            cuda_driver_entry_table, CUDA_ENTRY_cuMemImportFromShareableHandle);
+        CUresult r = import_func ? import_func(&imported, (void*)(intptr_t)lfd,
+                                               CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR)
+                                 : CUDA_ERROR_NOT_SUPPORTED;
+        close(lfd);
+        if (r != CUDA_SUCCESS) {
+          fprintf(stderr, "[HOOK] VMM IPC v2: import failed (%d)\n", (int)r);
+          return r;
+        }
+        g_vmm_import_handles[key] = imported;
+      }
+    }
+    CUdevice device;
+    typedef CUresult (*cuCtxGetDevice_t)(CUdevice*);
+    auto get_device_func =
+        (cuCtxGetDevice_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuCtxGetDevice);
+    get_device_func(&device);
+    size_t gran = get_allocation_granularity(device);
+    size_t map_size = align_to((size_t)size64, gran);
+    // Driver-chosen VA outside the region (real reserve, not the hooked one):
+    // peer VAs are runtime-only state and must not move the region cursor.
+    typedef CUresult (*cuMemAddressReserve_t)(CUdeviceptr*, size_t, size_t, CUdeviceptr,
+                                              unsigned long long);
+    auto reserve_func = (cuMemAddressReserve_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
+                                                                CUDA_ENTRY_cuMemAddressReserve);
+    CUdeviceptr va = 0;
+    CUresult r = reserve_func(&va, map_size, gran, 0, 0);
+    if (r != CUDA_SUCCESS) return r;
+    typedef CUresult (*cuMemMap_t)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle,
+                                   unsigned long long);
+    auto map_func = (cuMemMap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemMap);
+    r = map_func(va, map_size, (size_t)off64, imported, 0);
+    if (r != CUDA_SUCCESS) {
+      fprintf(stderr, "[HOOK] VMM IPC v2: map failed (%d) off=0x%llx size=%zu\n", (int)r,
+              (unsigned long long)off64, map_size);
+      return r;
+    }
+    CUmemAccessDesc acc = {};
+    acc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    acc.location.id = device;
+    acc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    typedef CUresult (*cuMemSetAccess_t)(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t);
+    auto set_access_func =
+        (cuMemSetAccess_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemSetAccess);
+    r = set_access_func(va, map_size, &acc, 1);
+    if (r != CUDA_SUCCESS) return r;
+    {
+      std::lock_guard<std::mutex> lk(g_vmm_ipc_mu);
+      g_vmm_import_maps[va] = VmmImportMapping{map_size};
+    }
+    static std::atomic<long> n_imp{0};
+    long k = ++n_imp;
+    if (k <= 2 || (k & (k - 1)) == 0)
+      fprintf(stderr, "[HOOK] VMM IPC v2 import #%ld pid=%d size=%zu -> va=0x%llx\n", k, pid,
+              map_size, (unsigned long long)va);
+    *pdptr = va;
+    return CUDA_SUCCESS;
+  }
 
   if (magic == VMM_IPC_MAGIC) {
     // This is a VMM IPC handle - extract the packed data
@@ -3393,6 +3632,23 @@ CUresult cuIpcCloseMemHandle(CUdeviceptr dptr) {
   typedef CUresult (*cuIpcCloseMemHandle_t)(CUdeviceptr);
   auto real_func = (cuIpcCloseMemHandle_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
                                                            CUDA_ENTRY_cuIpcCloseMemHandle);
+
+  {
+    std::lock_guard<std::mutex> lk(g_vmm_ipc_mu);
+    auto it = g_vmm_import_maps.find(dptr);
+    if (it != g_vmm_import_maps.end()) {
+      typedef CUresult (*cuMemUnmap_t)(CUdeviceptr, size_t);
+      auto unmap_func =
+          (cuMemUnmap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemUnmap);
+      typedef CUresult (*cuMemAddressFree_t)(CUdeviceptr, size_t);
+      auto afree_func = (cuMemAddressFree_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
+                                                             CUDA_ENTRY_cuMemAddressFree);
+      unmap_func(dptr, it->second.map_size);
+      afree_func(dptr, it->second.map_size);
+      g_vmm_import_maps.erase(it);
+      return CUDA_SUCCESS;  // imported handle stays cached for re-opens
+    }
+  }
 
   AllocMetadata metadata;
   bool found = false;

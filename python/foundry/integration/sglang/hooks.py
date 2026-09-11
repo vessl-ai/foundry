@@ -256,7 +256,7 @@ def _patch_cuda_graph_capture_v3() -> None:
         self, shape_key, forward_fn, capture_inputs=None, post_warmup_hook=None
     ):
         mode = get_graph_extension_mode()
-        if mode == CUDAGraphExtensionMode.NONE:
+        if mode == CUDAGraphExtensionMode.NONE or rt.draft_bypass_active():
             return orig_capture_one(
                 self,
                 shape_key,
@@ -309,7 +309,7 @@ def _patch_cuda_graph_capture_v3() -> None:
     @functools.wraps(orig_capture)
     def patched_capture(self):
         mode = get_graph_extension_mode()
-        if mode == CUDAGraphExtensionMode.NONE:
+        if mode == CUDAGraphExtensionMode.NONE or rt.draft_bypass_active():
             return orig_capture(self)
 
         from foundry.integration.sglang import decode_buffers_ops as dbo
@@ -333,6 +333,12 @@ def _patch_cuda_graph_capture_v3() -> None:
             rt.capture_final_alloc_offset()
             if dbo.enabled() and getattr(self, "buffer_registry", None) is not None:
                 dbo.record_registry_slots(self.buffer_registry)
+            from foundry.integration.sglang import autotune_ops
+
+            cfg_ws = rt.get_config().workspace_dir if rt.get_config() else None
+            if cfg_ws:
+                autotune_ops.save(cfg_ws, "after decode capture")
+                rt.check_no_nccl_in_cached_graphs(cfg_ws, "after decode capture")
             return result
 
         # LOAD: restore every archived graph and slot into the backend maps.
@@ -373,6 +379,16 @@ def _patch_cuda_graph_capture_v3() -> None:
         # the same order on both paths → identical addresses → the baked graph
         # stays valid.  The pool is kept alive for the process (the buffers must
         # outlive it).  Gated; empty_cache path kept as a diagnostic.
+        # Speculative draft runners (DSPARK/EAGLE draft model) are not cached:
+        # bypass every foundry capture hook for the duration of their init.
+        _mr = args[0] if args else kwargs.get("model_runner")
+        if getattr(_mr, "is_draft_worker", False):
+            logging.getLogger(__name__).info(
+                "[Foundry] draft model runner detected: bypassing graph caching "
+                "(plain capture)"
+            )
+            with rt.draft_bypass():
+                return orig_runner_init(self, *args, **kwargs)
         mode = get_graph_extension_mode()
         if mode != CUDAGraphExtensionMode.NONE:
             import torch
@@ -483,8 +499,15 @@ def _patch_init_torch_distributed() -> None:
     @functools.wraps(orig)
     def patched(self, *args, **kwargs):
         mode = get_graph_extension_mode()
-        if mode == CUDAGraphExtensionMode.NONE:
+        if mode == CUDAGraphExtensionMode.NONE or getattr(self, "is_draft_worker", False):
             return orig(self, *args, **kwargs)
+
+        if os.environ.get("FOUNDRY_MEMSNAP") == "1":
+            # Diagnostic: record allocation stacks so a later snapshot can tell
+            # which tensor owns each block (SAVE vs LOAD ownership diff).
+            import torch
+
+            torch.cuda.memory._record_memory_history(max_entries=500000, stacks="python")
 
         # Bind this rank's CUDA device BEFORE reserving the VMM region.
         # init_torch_distributed (orig) calls set_device(self.gpu_id)
@@ -531,7 +554,7 @@ def _patch_init_memory_pool() -> None:
     @functools.wraps(orig)
     def patched(self, pre_model_load_memory):
         mode = get_graph_extension_mode()
-        if mode == CUDAGraphExtensionMode.NONE:
+        if mode == CUDAGraphExtensionMode.NONE or getattr(self, "is_draft_worker", False):
             return orig(self, pre_model_load_memory)
 
         # Weight loading (the multi-threaded phase the free-side device sync
@@ -599,7 +622,7 @@ def _patch_kernel_warmup() -> None:
     @functools.wraps(orig)
     def patched(self, *args, **kwargs):
         mode = get_graph_extension_mode()
-        if mode == CUDAGraphExtensionMode.NONE:
+        if mode == CUDAGraphExtensionMode.NONE or getattr(self, "is_draft_worker", False):
             return orig(self, *args, **kwargs)
         # Phase 1 keeps pre-graph model-forward warmups out of SAVE/LOAD.
         logger.info("[Foundry] SGLang kernel_warmup skipped in %s mode", mode.value)
