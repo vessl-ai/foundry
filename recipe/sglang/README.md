@@ -152,3 +152,25 @@ For DP / EP each rank gets its own `rank_<N>/`.
 | `Reserved address … != requested base 0x600000000000` | VMM base collided with another allocation. Re-run; non-deterministic, the next run usually succeeds. |
 | EP replay `illegal memory access` / `nvshmemx_cumodule_init not found` | `libnvshmem_host.so.3` not preloaded — foundry couldn't auto-detect the `nvidia-nvshmem` wheel. Confirm it's installed (`pip show nvidia-nvshmem-cu13`), or set `nvshmem_host_path` in both TOMLs. |
 | `nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2` | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` too high for `NVSHMEM_QP_DEPTH`; lower it or raise the QP depth. |
+
+## Foundry integration patch
+
+`sglang-foundry-integration.patch` adds the `--foundry-graph-extension-config-path`
+option and activates the integration in the engine's worker processes:
+
+- `server_args.py`: the CLI/dataclass option, applied from `__post_init__`.
+- `scheduler.py`, `data_parallel_controller.py`: activate in each worker
+  process (the parent's call does not reach forked workers).
+- `foundry_shim.py` (new): forces the few server options that conflict with
+  graph caching and calls `foundry.integration.sglang.hooks.install_hooks`.
+
+Without the option the shim returns immediately, so a patched image behaves
+exactly like stock sglang and never imports foundry.
+
+Apply inside the image, then install foundry (needs cmake >= 4):
+
+```
+cd /sgl-workspace/sglang && git apply sglang-foundry-integration.patch
+pip install "cmake>=4.0"
+pip install --no-build-isolation "foundry @ git+https://github.com/vessl-ai/foundry@<sha>"
+```

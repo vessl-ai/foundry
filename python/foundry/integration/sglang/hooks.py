@@ -87,6 +87,29 @@ def _resolve_dp_rank(model_runner) -> int | None:
     return None
 
 
+def _warn_unsupported_graph_backends(server_args) -> None:
+    """Graph backends foundry does not cache.
+
+    Phase backends live in ``server_args.cuda_graph_config`` (full /
+    breakable / tc_piecewise / disabled).  Only full (decode) and breakable
+    (prefill) are captured by the hooks below; a torch.compile piecewise
+    prefill runs uncached, and a disabled phase has nothing to cache.  The
+    parent process calls install_hooks() before the resolution pipeline fills
+    the config in, so this is best-effort and silent when it is not resolved
+    yet -- the worker call sees the final config."""
+    cfg = getattr(server_args, "cuda_graph_config", None)
+    for phase in ("prefill", "decode"):
+        pc = getattr(cfg, phase, None)
+        backend = getattr(pc, "backend", None)
+        if backend in ("tc_piecewise", "disabled"):
+            logger.warning(
+                "[Foundry] %s CUDA graph backend is %r: foundry caches only "
+                "'breakable' (prefill) and 'full' (decode) graphs, so this "
+                "phase will run uncached",
+                phase, backend,
+            )
+
+
 def install_hooks(server_args) -> None:
     global _INSTALLED
     cfg_path = getattr(server_args, "foundry_graph_extension_config_path", None)
@@ -112,6 +135,8 @@ def install_hooks(server_args) -> None:
         get_graph_extension_mode().value,
         get_workspace_root(),
     )
+
+    _warn_unsupported_graph_backends(server_args)
 
     era = _detect_engine_era()
     _patch_init_torch_distributed()

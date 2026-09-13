@@ -1,0 +1,114 @@
+diff --git a/python/sglang/srt/managers/data_parallel_controller.py b/python/sglang/srt/managers/data_parallel_controller.py
+index 6a4766f..767bd2a 100644
+--- a/python/sglang/srt/managers/data_parallel_controller.py
++++ b/python/sglang/srt/managers/data_parallel_controller.py
+@@ -814,6 +814,10 @@ def run_data_parallel_controller_process(
+     pipe_writer,
+     run_scheduler_process_func: Callable = run_scheduler_process,
+ ):
++    if getattr(server_args, 'foundry_graph_extension_config_path', None):
++        from sglang.srt.foundry_shim import apply_server_args
++
++        apply_server_args(server_args)
+     setproctitle.setproctitle("sglang::data_parallel_controller")
+     faulthandler.enable()
+     kill_itself_when_parent_died()
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 2614e77..591412c 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -5021,6 +5021,10 @@ def run_scheduler_process(
+     display_dp_rank: Optional[int] = None,
+     display_moe_ep_rank: Optional[int] = None,
+ ):
++    if getattr(server_args, 'foundry_graph_extension_config_path', None):
++        from sglang.srt.foundry_shim import apply_server_args
++
++        apply_server_args(server_args)
+     # Load plugins so hooks can override Scheduler and its dependencies.
+     load_plugins()
+     # Publish before anything in this process reads configuration.
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index bd5eb72..3bb32b6 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -3587,7 +3587,13 @@ class ServerArgs:
+         NS("observability"),
+     ] = None
+ 
++    foundry_graph_extension_config_path: Optional[str] = None
++
+     def __post_init__(self):
++        if self.foundry_graph_extension_config_path:
++            from sglang.srt.foundry_shim import apply_server_args
++
++            apply_server_args(self)
+         self._run_resolution_pipeline()
+ 
+     def _run_resolution_pipeline(self):
+@@ -8721,6 +8727,12 @@ class ServerArgs:
+ 
+         # --- Fields with dynamic choices (computed at add_cli_args time) ---
+         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
++        parser.add_argument(
++            "--foundry-graph-extension-config-path",
++            type=str,
++            default=None,
++            help="Path to Foundry CUDA graph extension TOML config.",
++        )
+         parser.add_argument(
+             "--reasoning-parser",
+             type=str,
+diff --git a/python/sglang/srt/foundry_shim.py b/python/sglang/srt/foundry_shim.py
+new file mode 100644
+index 0000000..8fa5997
+--- /dev/null
++++ b/python/sglang/srt/foundry_shim.py
+@@ -0,0 +1,47 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Small activation shim for the Foundry SGLang integration."""
++
++from __future__ import annotations
++
++import logging
++import os
++
++logger = logging.getLogger(__name__)
++
++
++def apply_server_args(server_args) -> None:
++    cfg_path = getattr(server_args, "foundry_graph_extension_config_path", None)
++    if not cfg_path:
++        return
++
++    # Keep phase-1 SAVE/LOAD deterministic while preserving full-graph
++    # torch.compile semantics. Assignments are idempotent-safe (a worker
++    # process re-applies over an already-configured server_args) and
++    # frozen-safe (forks that freeze server_args after resolution).
++    def _force(name, value):
++        if getattr(server_args, name, None) == value:
++            return
++        try:
++            setattr(server_args, name, value)
++        except AttributeError:
++            try:
++                from sglang.srt.runtime_context import get_context
++
++                get_context().override("foundry", **{name: value})
++            except Exception:
++                logger.warning(
++                    "[Foundry] cannot override %s on frozen server_args", name
++                )
++
++    # NOTE: piecewise CUDA graphs are selected per phase through
++    # ``cuda_graph_config`` (full / breakable / tc_piecewise / disabled) on
++    # this tree; there is no ``disable_piecewise_cuda_graph`` flag to force
++    # here.  install_hooks() inspects the resolved config in the worker and
++    # warns when a phase asks for tc_piecewise, which foundry does not cache.
++    _force("enable_profile_cuda_graph", False)
++    _force("disable_flashinfer_autotune", True)
++
++    from foundry.integration.sglang.hooks import install_hooks
++
++    install_hooks(server_args)
++    logger.info("Foundry SGLang integration activated from %s", cfg_path)
