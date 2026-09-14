@@ -169,8 +169,114 @@ enum BinaryFlags : uint32_t {
 using ModuleHandles = std::tuple<CUmodule, std::unordered_map<std::string, CUfunction>>;
 using LibraryHandles = std::tuple<CUlibrary, std::unordered_map<std::string, CUkernel>>;
 
+// ---------------------------------------------------------------------------
+// Fatbin blob spill
+//
+// SAVE keeps every CUDA binary image it intercepts so pack_fatbins_to_folder()
+// can write them when capture is done.  Held for the whole process that is
+// multiple GB of host memory on a large model -- Solar-Pro-4 W4AFP8 packs
+// 7.3 GB of images per rank, and the retention showed up as +37 GB of pod
+// anonymous memory during SAVE versus an identical LOAD run.
+//
+// So spill the bytes to a scratch file as they arrive and keep only
+// {offset,size}; the packer streams each image back one at a time.  The
+// scratch file is unlinked right after it is created, so the kernel reclaims
+// it when the process exits however it exits.
+// ---------------------------------------------------------------------------
+struct BlobRef {
+  uint64_t offset = 0;
+  uint64_t size = 0;
+  bool spilled = false;
+};
+
+static std::mutex blob_spill_mutex;
+static int blob_spill_fd = -1;
+static uint64_t blob_spill_pos = 0;
+static bool blob_spill_broken = false;
+
+static bool blob_spill_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("FOUNDRY_FATBIN_SPILL");
+    return !v || std::string(v) != "0";
+  }();
+  return on;
+}
+
+// Caller holds blob_spill_mutex.
+static bool blob_spill_open_locked() {
+  if (blob_spill_fd >= 0) return true;
+  if (blob_spill_broken) return false;
+  const char* dir = std::getenv("FOUNDRY_FATBIN_SPILL_DIR");
+  if (!dir) dir = std::getenv("TMPDIR");
+  if (!dir) dir = "/tmp";
+  std::string tmpl = std::string(dir) + "/foundry_fatbin_XXXXXX";
+  std::vector<char> buf(tmpl.begin(), tmpl.end());
+  buf.push_back('\0');
+  const int fd = mkstemp(buf.data());
+  if (fd < 0) {
+    fprintf(stderr, "[HOOK] WARN: fatbin spill file in %s failed (%s); keeping images in memory\n",
+            dir, strerror(errno));
+    blob_spill_broken = true;
+    return false;
+  }
+  unlink(buf.data());  // anonymous from here on; freed on exit
+  blob_spill_fd = fd;
+  blob_spill_pos = 0;
+  fprintf(stderr, "[HOOK] INFO: fatbin images spill to %s (unlinked)\n", buf.data());
+  return true;
+}
+
+static BlobRef blob_spill_append(const uint8_t* data, size_t size) {
+  BlobRef ref;
+  if (!blob_spill_enabled() || size == 0) return ref;
+  std::lock_guard<std::mutex> lock(blob_spill_mutex);
+  if (!blob_spill_open_locked()) return ref;
+  const uint64_t off = blob_spill_pos;
+  size_t done = 0;
+  while (done < size) {
+    const ssize_t n = pwrite(blob_spill_fd, data + done, size - done, (off_t)(off + done));
+    if (n <= 0) {
+      if (errno == EINTR) continue;
+      fprintf(stderr, "[HOOK] WARN: fatbin spill write failed (%s); keeping images in memory\n",
+              strerror(errno));
+      blob_spill_broken = true;
+      close(blob_spill_fd);
+      blob_spill_fd = -1;
+      return ref;  // not spilled -> caller keeps the bytes
+    }
+    done += (size_t)n;
+  }
+  blob_spill_pos = off + size;
+  ref.offset = off;
+  ref.size = size;
+  ref.spilled = true;
+  return ref;
+}
+
+static bool blob_spill_read(const BlobRef& ref, std::vector<uint8_t>& out) {
+  if (!ref.spilled) return false;
+  out.resize(ref.size);
+  size_t done = 0;
+  while (done < ref.size) {
+    const ssize_t n = pread(blob_spill_fd, out.data() + done, ref.size - done,
+                            (off_t)(ref.offset + done));
+    if (n <= 0) {
+      if (errno == EINTR) continue;
+      fprintf(stderr, "[HOOK] ERROR: fatbin spill read failed at %llu+%llu (%s)\n",
+              (unsigned long long)ref.offset, (unsigned long long)ref.size, strerror(errno));
+      out.clear();
+      return false;
+    }
+    done += (size_t)n;
+  }
+  return true;
+}
+
 struct BinaryMetadata {
+  // Either binary_data holds the image, or binary_blob points at the spill
+  // file. Never both -- use metadata_store_binary / metadata_load_binary.
   std::vector<uint8_t> binary_data;
+  BlobRef binary_blob;
   std::string base_func_name;
   std::string filename;
   std::vector<CUjit_option> jit_options;
@@ -180,8 +286,64 @@ struct BinaryMetadata {
   std::vector<std::string> entrypoint_names;
   bool used = false;
   std::vector<std::vector<uint8_t>> linked_fatbin_segments;
+  std::vector<BlobRef> segment_blobs;
   uint32_t binary_flags = BINARY_FLAG_NONE;  // Bit flags for binary properties
 };
+
+static void metadata_store_binary(BinaryMetadata& m, std::vector<uint8_t>&& bytes) {
+  m.binary_blob = blob_spill_append(bytes.data(), bytes.size());
+  if (m.binary_blob.spilled) {
+    m.binary_data.clear();
+    m.binary_data.shrink_to_fit();
+  } else {
+    m.binary_data = std::move(bytes);
+  }
+}
+
+static size_t metadata_binary_size(const BinaryMetadata& m) {
+  return m.binary_blob.spilled ? (size_t)m.binary_blob.size : m.binary_data.size();
+}
+
+static std::vector<uint8_t> metadata_load_binary(const BinaryMetadata& m) {
+  if (!m.binary_blob.spilled) return m.binary_data;
+  std::vector<uint8_t> out;
+  blob_spill_read(m.binary_blob, out);
+  return out;
+}
+
+static void metadata_store_segments(BinaryMetadata& m,
+                                    std::vector<std::vector<uint8_t>>&& segments) {
+  std::vector<BlobRef> refs;
+  refs.reserve(segments.size());
+  for (const auto& seg : segments) {
+    const BlobRef r = blob_spill_append(seg.data(), seg.size());
+    if (!r.spilled) {  // spill unavailable -> keep every segment in memory
+      m.linked_fatbin_segments = std::move(segments);
+      m.segment_blobs.clear();
+      return;
+    }
+    refs.push_back(r);
+  }
+  m.segment_blobs = std::move(refs);
+  m.linked_fatbin_segments.clear();
+  m.linked_fatbin_segments.shrink_to_fit();
+}
+
+static size_t metadata_num_segments(const BinaryMetadata& m) {
+  return m.segment_blobs.empty() ? m.linked_fatbin_segments.size() : m.segment_blobs.size();
+}
+
+static std::vector<std::vector<uint8_t>> metadata_load_segments(const BinaryMetadata& m) {
+  if (m.segment_blobs.empty()) return m.linked_fatbin_segments;
+  std::vector<std::vector<uint8_t>> out;
+  out.reserve(m.segment_blobs.size());
+  for (const auto& r : m.segment_blobs) {
+    std::vector<uint8_t> seg;
+    if (!blob_spill_read(r, seg)) return {};
+    out.push_back(std::move(seg));
+  }
+  return out;
+}
 
 static std::atomic<int> dumped_binary_counter{0};
 static std::once_flag load_once_flag;
@@ -869,13 +1031,13 @@ static void dump_fatbin_and_info(const void* data_ptr, std::string_view func_nam
     }
   }
 
-  const std::vector<uint8_t> binary_vec(binary_data, binary_data + total_size);
+  std::vector<uint8_t> binary_vec(binary_data, binary_data + total_size);
   const uint64_t hash = compute_hash(binary_vec);
   if (out_hash)
     *out_hash = hash;
 
   BinaryMetadata metadata;
-  metadata.binary_data = binary_vec;
+  metadata_store_binary(metadata, std::move(binary_vec));
   metadata.base_func_name = std::string(func_name);
 
   if (numJitOptions > 0 && jitOptions) {
@@ -900,10 +1062,10 @@ static void dump_fatbin_and_info(const void* data_ptr, std::string_view func_nam
   // Store linked fatbin segments if this is a device-linked library
   if (!linked_fatbin_segments.empty()) {
     metadata.binary_flags |= BINARY_FLAG_NEEDS_DEVICE_LINK;
-    metadata.linked_fatbin_segments = std::move(linked_fatbin_segments);
+    metadata_store_segments(metadata, std::move(linked_fatbin_segments));
 #ifdef HOOK_DEBUG
     fprintf(stderr, "[HOOK] DEBUG: Stored %zu fatbin segments for device linking (hash %016llx)\n",
-            metadata.linked_fatbin_segments.size(), (unsigned long long)hash);
+            metadata_num_segments(metadata), (unsigned long long)hash);
 #endif
   }
 
@@ -973,7 +1135,7 @@ static void dump_fatbin_from_file_and_info(const char* filename, std::string_vie
     *out_hash = hash;
 
   BinaryMetadata metadata;
-  metadata.binary_data = file_contents;
+  metadata_store_binary(metadata, std::vector<uint8_t>(file_contents));
   metadata.base_func_name = std::string(func_name);
   metadata.filename = filename;
 
@@ -1821,17 +1983,22 @@ static void pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
     uint32_t binary_flags = metadata.binary_flags;
     std::vector<uint8_t> linked_cubin;
     bool has_segments =
-        (binary_flags & BINARY_FLAG_NEEDS_DEVICE_LINK) && !metadata.linked_fatbin_segments.empty();
+        (binary_flags & BINARY_FLAG_NEEDS_DEVICE_LINK) && metadata_num_segments(metadata) > 0;
+
+    // Images live in the spill file; stream this entry's bytes back in and let
+    // them go at the end of the visit so only one binary is resident at a time.
+    std::vector<std::vector<uint8_t>> segments;
+    if (has_segments) segments = metadata_load_segments(metadata);
 
     if (has_segments) {
       // Try to pre-link the segments to avoid runtime linking during LOAD
-      linked_cubin = prelink_fatbin_segments(metadata.linked_fatbin_segments, metadata.jit_options,
+      linked_cubin = prelink_fatbin_segments(segments, metadata.jit_options,
                                              metadata.jit_option_values, hash);
       if (!linked_cubin.empty()) {
         // Pre-linking succeeded - clear NEEDS_DEVICE_LINK, will be stored as normal binary
         binary_flags &= ~BINARY_FLAG_NEEDS_DEVICE_LINK;
         has_segments = false;
-      } else if (!metadata.binary_data.empty()) {
+      } else if (metadata_binary_size(metadata) > 0) {
         // Pre-linking failed but we hold the original image the process
         // actually loaded from (e.g. cutlass fatbins whose collected
         // segments the CUDA linker rejects with NO_BINARY_FOR_GPU).
@@ -1842,8 +2009,7 @@ static void pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
         fprintf(stderr,
                 "[HOOK] INFO: pre-link failed for hash %016llx; packing original image "
                 "(%zu bytes) instead of %zu segments\n",
-                (unsigned long long)hash, metadata.binary_data.size(),
-                metadata.linked_fatbin_segments.size());
+                (unsigned long long)hash, metadata_binary_size(metadata), segments.size());
       }
     }
 
@@ -1857,12 +2023,12 @@ static void pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
     } else if (has_segments) {
       // Fallback: Write marker for device-linked binary (size = 0, followed by segment count)
       const size_t marker = 0;
-      const size_t num_segments = metadata.linked_fatbin_segments.size();
+      const size_t num_segments = segments.size();
       packed_img.write(reinterpret_cast<const char*>(&marker), sizeof(size_t));
       packed_img.write(reinterpret_cast<const char*>(&num_segments), sizeof(size_t));
 
       // Write each segment
-      for (const auto& segment : metadata.linked_fatbin_segments) {
+      for (const auto& segment : segments) {
         const size_t seg_size = segment.size();
         packed_img.write(reinterpret_cast<const char*>(&seg_size), sizeof(size_t));
         packed_img.write(reinterpret_cast<const char*>(segment.data()), seg_size);
@@ -1873,9 +2039,10 @@ static void pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
           num_segments, (unsigned long long)hash);
     } else {
       // Regular single binary
-      const size_t size = metadata.binary_data.size();
+      const std::vector<uint8_t> image = metadata_load_binary(metadata);
+      const size_t size = image.size();
       packed_img.write(reinterpret_cast<const char*>(&size), sizeof(size_t));
-      packed_img.write(reinterpret_cast<const char*>(metadata.binary_data.data()), size);
+      packed_img.write(reinterpret_cast<const char*>(image.data()), size);
     }
 
     // Write metadata to txt file
@@ -1907,7 +2074,7 @@ static void pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
     // Write binary_flags and num_segments if needed
     packed_txt << ",binary_flags=" << binary_flags;
     if (has_segments) {
-      packed_txt << ",num_segments=" << metadata.linked_fatbin_segments.size();
+      packed_txt << ",num_segments=" << segments.size();
     }
 
     packed_txt << "\n";
