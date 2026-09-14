@@ -337,7 +337,19 @@ def _patch_cuda_graph_capture_v3() -> None:
         if mode == CUDAGraphExtensionMode.NONE or rt.draft_bypass_active():
             return orig_capture(self)
 
+        from foundry.integration.sglang import bcg_ops as _bcg
         from foundry.integration.sglang import decode_buffers_ops as dbo
+
+        # Under PD disaggregation a decode-role server has the prefill phase
+        # disabled, so the BCG hook that normally does the multimem prebuild
+        # and the autotune / EP-map restore never runs.  Do it here instead
+        # (before preallocate, same as on the prefill path).
+        _mr = getattr(self, "model_runner", None)
+        _decode_only = _mr is not None and rt.phase_graph_disabled(
+            getattr(_mr, "server_args", None), "prefill"
+        )
+        if _decode_only:
+            _bcg.shared_capture_setup_pre(_mr, mode)
 
         if mode == CUDAGraphExtensionMode.LOAD:
             rt.log_alloc_offset("before_preallocate")
@@ -346,6 +358,9 @@ def _patch_cuda_graph_capture_v3() -> None:
 
         _v3_load_keys.clear()
         result = orig_capture(self)
+
+        if _decode_only:
+            _bcg.shared_capture_setup_post(_mr, mode, "after decode capture")
 
         if mode == CUDAGraphExtensionMode.SAVE:
             from foundry.integration.sglang.graph_ops import (

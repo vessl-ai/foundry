@@ -205,6 +205,31 @@ def compute_archive_fingerprint(server_args) -> dict:
     }
 
 
+def phase_graph_backend(server_args, phase: str) -> str | None:
+    """Resolved CUDA-graph backend for ``phase`` ("prefill" / "decode").
+
+    Returns the backend name ("full", "breakable", "tc_piecewise",
+    "disabled") or None while ``server_args`` is still being resolved.
+    """
+    cfg = getattr(server_args, "cuda_graph_config", None)
+    pc = getattr(cfg, phase, None)
+    backend = getattr(pc, "backend", None)
+    if backend is None:
+        return None
+    return str(getattr(backend, "value", backend))
+
+
+def phase_graph_disabled(server_args, phase: str) -> bool:
+    """True only when ``phase`` is resolved and explicitly disabled.
+
+    PD disaggregation turns one phase off per role: a prefill-role server
+    disables decode graphs, a decode-role server disables prefill graphs
+    (sglang ``_apply_cuda_graph_disaggregation_roles``).  The capture hooks
+    key their shared setup and their archive finalization off this.
+    """
+    return phase_graph_backend(server_args, phase) == "disabled"
+
+
 def _auto_decision(server_args) -> tuple[CUDAGraphExtensionMode, str]:
     cfg = get_config()
     root = Path(cfg.workspace_root)
@@ -382,6 +407,69 @@ def skip_to_scratch_boundary() -> None:
         return
     cge.set_current_alloc_offset(scratch)
     logger.info("[Foundry] SGLang skipped allocator to scratch boundary %d", scratch)
+
+
+_ALLOC_PIN_FILE = "alloc_pin.json"
+_ALLOC_PIN_ALIGN = 1 << 30  # 1 GiB
+_ALLOC_PIN_PAD = 1 << 28  # 256 MiB
+
+
+def pin_alloc_offset(label: str) -> None:
+    """Pin the region cursor to the same absolute offset on SAVE and LOAD.
+
+    Everything the region allocator hands out downstream of this point —
+    the symmetric-memory all-gather buffer, the EP dispatcher maps, the
+    graph buffers — must land at the same address on LOAD as it did on
+    SAVE, or restored graphs read the wrong memory.
+
+    The cursor reaching here is not reliably reproducible: a transient
+    allocation that is made and freed upstream leaves the bump cursor
+    advanced without moving any of the tensors the pointer map verifies.
+    Observed on Solar-Pro-4 W4AFP8 tp2/ep2 under PD disaggregation as a
+    78 MiB rank-1-only shift in roughly one start in four, which moved the
+    symmetric-memory buffer and failed the multimem address check.
+
+    So SAVE records an absolute target (its own cursor rounded up past a
+    pad, to leave room for a LOAD that jitters higher) and LOAD jumps the
+    cursor to exactly that target.  Rounding up costs at most
+    pad + align of region space, which is nothing against a 512 GB region.
+    """
+    cfg = get_config()
+    if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
+        return
+    if os.environ.get("FOUNDRY_PIN_ALLOC_OFFSET", "1") != "1":
+        return
+    if cfg.workspace_dir is None:
+        return
+    path = os.path.join(cfg.workspace_dir, _ALLOC_PIN_FILE)
+    current = cge.get_current_alloc_offset()
+
+    if cfg.mode == CUDAGraphExtensionMode.SAVE:
+        target = current + _ALLOC_PIN_PAD
+        target = -(-target // _ALLOC_PIN_ALIGN) * _ALLOC_PIN_ALIGN
+        cge.set_current_alloc_offset(target)
+        with open(path, "w") as f:
+            json.dump({"label": label, "offset": target}, f)
+        logger.info(
+            "[Foundry] alloc offset pinned at %s: %d -> %d", label, current, target
+        )
+        return
+
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        target = int(json.load(f)["offset"])
+    if current > target:
+        raise RuntimeError(
+            f"[Foundry] alloc offset at {label} is {current}, past the pinned "
+            f"{target} recorded at SAVE — the archive cannot be restored at the "
+            f"addresses it was captured with (re-SAVE, or raise the pin pad)"
+        )
+    cge.set_current_alloc_offset(target)
+    logger.info(
+        "[Foundry] alloc offset pinned at %s: %d -> %d (from archive)",
+        label, current, target,
+    )
 
 
 def capture_final_alloc_offset() -> int:

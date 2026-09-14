@@ -1037,19 +1037,10 @@ def _install_param_map_probe() -> None:
                     )
         except Exception as exc:
             logger.warning("[Foundry] model ptr probe failed: %s", exc)
-        from foundry.integration.sglang import autotune_ops
-
-        if mode in (CUDAGraphExtensionMode.SAVE, CUDAGraphExtensionMode.LOAD):
-            _prebuild_multimem_gatherers(self.model_runner.model)
-        if mode == CUDAGraphExtensionMode.LOAD:
-            autotune_ops.load(_workspace_dir())
-            _restore_ep_dispatcher_maps(self.model_runner.model)
-        elif mode == CUDAGraphExtensionMode.SAVE:
-            _ensure_ep_dispatcher_maps_in_region(self.model_runner.model)
+        shared_capture_setup_pre(self.model_runner, mode)
         result = orig(self, *args, **kwargs)
-        if mode == CUDAGraphExtensionMode.SAVE:
-            _record_ep_dispatcher_maps(self.model_runner.model)
-            autotune_ops.save(_workspace_dir(), "after prefill capture")
+        shared_capture_setup_post(self.model_runner, mode, "after prefill capture")
+        finalize_archive_if_last_capture(self.model_runner, mode, "decode")
         return result
 
     patched._foundry_param_probe = True
@@ -1264,3 +1255,68 @@ def verify_capture_inputs(size: int, capture_inputs: Any) -> None:
         )
     else:
         logger.info("[Foundry] BCG size=%d input buffers verified (%d)", size, len(want))
+
+
+# --- shared capture setup -------------------------------------------------
+#
+# These three steps must run exactly once per process, around whichever graph
+# capture actually happens.  In a standalone server that is the prefill (BCG)
+# capture, which runs first.  Under PD disaggregation sglang disables one
+# phase per role, so a decode-role server never enters the prefill hook at
+# all -- the decode hook calls these instead (see hooks.py).
+
+
+def shared_capture_setup_pre(model_runner, mode) -> None:
+    """Multimem prebuild + autotune/EP-map restore, before graph capture."""
+    from foundry.integration.sglang import autotune_ops
+
+    from foundry.integration.sglang import runtime as _rt
+
+    model = model_runner.model
+    if mode in (CUDAGraphExtensionMode.SAVE, CUDAGraphExtensionMode.LOAD):
+        _rt.pin_alloc_offset("before multimem prebuild")
+        _prebuild_multimem_gatherers(model)
+    if mode == CUDAGraphExtensionMode.LOAD:
+        autotune_ops.load(_workspace_dir())
+        _restore_ep_dispatcher_maps(model)
+    elif mode == CUDAGraphExtensionMode.SAVE:
+        _ensure_ep_dispatcher_maps_in_region(model)
+
+
+def shared_capture_setup_post(model_runner, mode, tag: str) -> None:
+    """Record EP maps and pin autotune decisions, after graph capture."""
+    from foundry.integration.sglang import autotune_ops
+
+    if mode != CUDAGraphExtensionMode.SAVE:
+        return
+    _record_ep_dispatcher_maps(model_runner.model)
+    autotune_ops.save(_workspace_dir(), tag)
+
+
+def finalize_archive_if_last_capture(model_runner, mode, other_phase: str) -> None:
+    """Write the archive's completion marker when no further capture follows.
+
+    ``final_alloc_offset.json`` is what makes an archive complete for auto
+    mode, and it is normally written at the end of decode capture.  A PD
+    prefill-role server disables decode graphs, so without this the archive
+    stays incomplete forever and auto mode re-SAVEs on every start.
+    """
+    if mode != CUDAGraphExtensionMode.SAVE:
+        return
+    from foundry.integration.sglang import runtime as _rt
+
+    server_args = getattr(model_runner, "server_args", None)
+    if server_args is None or not _rt.phase_graph_disabled(server_args, other_phase):
+        return
+    from foundry.integration.sglang.graph_ops import pack_fatbins, save_graph_manifest
+
+    save_graph_manifest()
+    pack_fatbins()
+    _rt.capture_final_alloc_offset()
+    ws = _workspace_dir()
+    if ws:
+        _rt.check_no_nccl_in_cached_graphs(ws, f"{other_phase} graphs disabled")
+    logger.info(
+        "[Foundry] archive finalized after capture (%s graphs disabled by PD role)",
+        other_phase,
+    )
