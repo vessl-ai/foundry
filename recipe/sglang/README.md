@@ -145,6 +145,34 @@ foundry_archive/
 
 For DP / EP each rank gets its own `rank_<N>/`.
 
+## PD disaggregation
+
+Works from 99eeee0 on, with one deployment requirement that is not in this repo.
+
+**Set `WITH_NVIDIA_PEERMEM=0` on every server that runs foundry with mooncake KV
+transfer.** Mooncake defaults it to 1, which forces the legacy `ibv_reg_mr` path;
+that path resolves addresses through nvidia_peermem, which does not recognise
+memory mapped by the VMM APIs, so registering foundry's region fails with EFAULT
+("Bad address") and every KV transfer fails. With it set to 0 mooncake exports a
+dma-buf fd (`cuMemGetHandleForAddressRange`) and registers with
+`ibv_reg_dmabuf_mr`, which VMM memory supports.
+
+The variable is read per process, so scope it to the pods that enable foundry.
+Setting it fleet-wide also changes the registration path for servers that do not
+use foundry, and mooncake does not fall back to `ibv_reg_mr` if the dma-buf export
+fails — it errors out. Measured on H200 with ordinary (non-foundry) memory the two
+paths perform the same, so there is no throughput reason to flip it anywhere else.
+
+Roles cache different things, because sglang disables one graph phase per role:
+
+| Role | Cached | Startup |
+|---|---|---|
+| `--disaggregation-mode=prefill` | prefill (breakable) graphs | meaningful win — capture is tens of seconds |
+| `--disaggregation-mode=decode` | decode (full) graphs | little to gain — capture is a few seconds |
+
+Give each server its own `workspace_root`; the two roles produce different
+archives and must not share one.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
