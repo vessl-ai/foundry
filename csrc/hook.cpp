@@ -21,6 +21,7 @@
 #include <unordered_set>
 #include <fstream>
 #include <vector>
+#include <stdexcept>
 #include <string_view>
 #include <unistd.h>
 #include <boost/unordered/concurrent_flat_map.hpp>
@@ -239,9 +240,9 @@ static BlobRef blob_spill_append(const uint8_t* data, size_t size) {
       if (errno == EINTR) continue;
       fprintf(stderr, "[HOOK] WARN: fatbin spill write failed (%s); keeping images in memory\n",
               strerror(errno));
+      // Stop appending, but keep the fd open: blobs written before this point
+      // are still referenced by metadata and must remain readable at pack time.
       blob_spill_broken = true;
-      close(blob_spill_fd);
-      blob_spill_fd = -1;
       return ref;  // not spilled -> caller keeps the bytes
     }
     done += (size_t)n;
@@ -304,10 +305,10 @@ static size_t metadata_binary_size(const BinaryMetadata& m) {
   return m.binary_blob.spilled ? (size_t)m.binary_blob.size : m.binary_data.size();
 }
 
-static std::vector<uint8_t> metadata_load_binary(const BinaryMetadata& m) {
+static std::vector<uint8_t> metadata_load_binary(const BinaryMetadata& m, bool* ok = nullptr) {
   if (!m.binary_blob.spilled) return m.binary_data;
   std::vector<uint8_t> out;
-  blob_spill_read(m.binary_blob, out);
+  if (!blob_spill_read(m.binary_blob, out) && ok) *ok = false;
   return out;
 }
 
@@ -333,13 +334,17 @@ static size_t metadata_num_segments(const BinaryMetadata& m) {
   return m.segment_blobs.empty() ? m.linked_fatbin_segments.size() : m.segment_blobs.size();
 }
 
-static std::vector<std::vector<uint8_t>> metadata_load_segments(const BinaryMetadata& m) {
+static std::vector<std::vector<uint8_t>> metadata_load_segments(const BinaryMetadata& m,
+                                                               bool* ok = nullptr) {
   if (m.segment_blobs.empty()) return m.linked_fatbin_segments;
   std::vector<std::vector<uint8_t>> out;
   out.reserve(m.segment_blobs.size());
   for (const auto& r : m.segment_blobs) {
     std::vector<uint8_t> seg;
-    if (!blob_spill_read(r, seg)) return {};
+    if (!blob_spill_read(r, seg)) {
+      if (ok) *ok = false;
+      return {};
+    }
     out.push_back(std::move(seg));
   }
   return out;
@@ -1955,7 +1960,7 @@ static std::vector<uint8_t> prelink_fatbin_segments(
   return linked_cubin;
 }
 
-static void pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
+static bool pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
   fs::create_directories(archive_dir);
 
   const fs::path packed_img_path = archive_dir / "fatbin_image_packed.img";
@@ -1965,8 +1970,12 @@ static void pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
   std::ofstream packed_txt(packed_txt_path.string());
 
   if (!packed_img || !packed_txt) {
-    return;
+    return false;
   }
+
+  // A blob that cannot be read back must never be written as a short entry:
+  // the archive would look complete and LOAD would fault on a truncated image.
+  bool spill_ok = true;
 
   binary_hash_to_metadata.cvisit_all([&](const auto& pair) {
     const uint64_t hash = pair.first;
@@ -1988,7 +1997,7 @@ static void pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
     // Images live in the spill file; stream this entry's bytes back in and let
     // them go at the end of the visit so only one binary is resident at a time.
     std::vector<std::vector<uint8_t>> segments;
-    if (has_segments) segments = metadata_load_segments(metadata);
+    if (has_segments) segments = metadata_load_segments(metadata, &spill_ok);
 
     if (has_segments) {
       // Try to pre-link the segments to avoid runtime linking during LOAD
@@ -2039,7 +2048,7 @@ static void pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
           num_segments, (unsigned long long)hash);
     } else {
       // Regular single binary
-      const std::vector<uint8_t> image = metadata_load_binary(metadata);
+      const std::vector<uint8_t> image = metadata_load_binary(metadata, &spill_ok);
       const size_t size = image.size();
       packed_img.write(reinterpret_cast<const char*>(&size), sizeof(size_t));
       packed_img.write(reinterpret_cast<const char*>(image.data()), size);
@@ -2084,6 +2093,20 @@ static void pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
     }
     packed_txt << "---\n";
   });
+
+  if (!spill_ok) {
+    packed_img.close();
+    packed_txt.close();
+    boost::system::error_code ec;
+    fs::remove(packed_img_path, ec);
+    fs::remove(packed_txt_path, ec);
+    fprintf(stderr,
+            "[HOOK] ERROR: could not read back spilled fatbin images; removed the "
+            "partial archive at %s so it cannot be loaded\n",
+            archive_dir.string().c_str());
+    return false;
+  }
+  return true;
 }
 
 static void pack_fatbins_on_exit() {
@@ -4308,7 +4331,10 @@ int init_nvshmem_for_loaded_modules() {
 }
 
 void pack_fatbins_to_folder(const std::string& folder_path) {
-  pack_fatbins_to_folder_impl(fs::path(folder_path));
+  if (!pack_fatbins_to_folder_impl(fs::path(folder_path))) {
+    throw std::runtime_error("foundry: packing fatbins into " + folder_path +
+                             " failed; see [HOOK] ERROR above");
+  }
 }
 
 std::variant<CUfunction, CUkernel> query_function_handle(uint64_t binary_hash,
