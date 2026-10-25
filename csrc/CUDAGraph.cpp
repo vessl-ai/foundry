@@ -1929,6 +1929,10 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
 
       json::object params;
       params["event_id"] = event_to_id[metadata.event];
+      unsigned int event_flags;
+      if (query_event_flags(metadata.event, &event_flags)) {
+        params["event_flags"] = event_flags;
+      }
       node_obj["params"] = params;
 
     } else if (std::holds_alternative<EventWaitNodeMetadata>(graphNode.metadata)) {
@@ -1941,6 +1945,10 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
 
       json::object params;
       params["event_id"] = event_to_id[metadata.event];
+      unsigned int event_flags;
+      if (query_event_flags(metadata.event, &event_flags)) {
+        params["event_flags"] = event_flags;
+      }
       node_obj["params"] = params;
 
     } else if (std::holds_alternative<EmptyNodeMetadata>(graphNode.metadata)) {
@@ -2608,10 +2616,7 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
 
       CUevent event;
       if (event_id_to_event.find(event_id) == event_id_to_event.end()) {
-        // Rebuilt event nodes only order work inside the graph and nothing reads
-        // their timestamps; a timing-enabled event adds replay cost at every
-        // record/wait node.
-        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING));
+        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, saved_event_flags(params)));
         event_id_to_event[event_id] = event;
         graph->loaded_graph_resources_->created_events.push_back(event);
       } else {
@@ -2625,7 +2630,7 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
 
       CUevent event;
       if (event_id_to_event.find(event_id) == event_id_to_event.end()) {
-        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING));
+        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, saved_event_flags(params)));
         event_id_to_event[event_id] = event;
         graph->loaded_graph_resources_->created_events.push_back(event);
       } else {

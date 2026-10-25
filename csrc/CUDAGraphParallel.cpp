@@ -775,10 +775,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       int event_id = params.at("event_id").to_number<int>();
       CUevent event;
       if (event_id_to_event.find(event_id) == event_id_to_event.end()) {
-        // Rebuilt event nodes only order work inside the graph and nothing reads
-        // their timestamps; a timing-enabled event adds replay cost at every
-        // record/wait node.
-        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING));
+        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, saved_event_flags(params)));
         event_id_to_event[event_id] = event;
         graph->loaded_graph_resources_->created_events.push_back(event);
       } else {
@@ -790,7 +787,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       int event_id = params.at("event_id").to_number<int>();
       CUevent event;
       if (event_id_to_event.find(event_id) == event_id_to_event.end()) {
-        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING));
+        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, saved_event_flags(params)));
         event_id_to_event[event_id] = event;
         graph->loaded_graph_resources_->created_events.push_back(event);
       } else {
@@ -1277,7 +1274,7 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
       CUevent event;
       auto eit = event_id_to_event.find(event_id);
       if (eit == event_id_to_event.end()) {
-        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING));
+        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, saved_event_flags(params)));
         event_id_to_event[event_id] = event;
         if (!graph->loaded_graph_resources_) {
           graph->loaded_graph_resources_ = std::make_unique<LoadedGraphResources>();
@@ -1294,7 +1291,7 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
       CUevent event;
       auto eit = event_id_to_event.find(event_id);
       if (eit == event_id_to_event.end()) {
-        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING));
+        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, saved_event_flags(params)));
         event_id_to_event[event_id] = event;
         if (!graph->loaded_graph_resources_) {
           graph->loaded_graph_resources_ = std::make_unique<LoadedGraphResources>();
@@ -1564,7 +1561,7 @@ void CUDAGraph::prepare_on_demand_graph_binary(const BinaryGraphFile& bin_file,
         auto eit = event_id_to_event.find(event_id);
         CUevent event;
         if (eit == event_id_to_event.end()) {
-          C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING));
+          C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, entry.event.flags));
           event_id_to_event[event_id] = event;
           if (!graph->loaded_graph_resources_) {
             graph->loaded_graph_resources_ = std::make_unique<LoadedGraphResources>();
