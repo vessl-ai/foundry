@@ -75,6 +75,12 @@ all-reduce through torch symmetric memory (validated attn-TP + EP rows up to att
   captured stream (`deep_ep_cpp.Buffer(...)` → "operation not permitted when stream is
   capturing"). The hook forces it before the capture loop, unwrapping the
   `MaybeTboDeepEPDispatcher._inners` to reach a `DeepEPDispatcher`. Runs on SAVE and LOAD.
+- **EP expert map bootstrap** (`bootstrap_ep_expert_maps`, graph_ops). Under EP without an
+  all-to-all backend, `StandardDispatcher` builds `local_expert_mapping` (global to local expert ids,
+  for the triton / deep_gemm runners) on the first dispatch. Without warmup forwards that is the
+  first captured forward: the map is allocated there and the kernels that fill it run only when
+  that graph replays, so eager forwards and the other graphs read it unfilled. The hook builds
+  every map before the capture loop. Runs on SAVE and LOAD.
 - **Logits all-gather bootstrap** (`bootstrap_logits_gatherer`, `capture()` patch, SAVE and LOAD).
   sglang's `LogitsProcessor` gathers TP-sharded logits through `MultimemAllGatherer`, whose torch
   symmetric-memory buffer, multicast mapping and signal pads are built lazily on the first *eager*

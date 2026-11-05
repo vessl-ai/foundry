@@ -13,6 +13,7 @@ serve settings of the recipes in recipe/sglang/. Assertions:
 
 Cases (args copied from the recipe lines cited in CASES; a recipe change must show up here):
   q35_tp2 / q35_ep2 / q35_tpep2   Qwen3.5-35B-A3B on 2 GPUs (serve_qwen3.5-35ba3b.sh), real weights
+  q35_tpep2_a2a_none              q35_tpep2 with --moe-a2a-backend none and the triton MoE runner (not a recipe)
   q35_122b_fp8_ep4                Qwen3.5-122B-A10B-FP8 ep4 (serve_qwen3.5-122ba10b.sh), xlarge, dummy weights
   dsv4_flash_fp8_ep4              DeepSeek-V4-Flash-FP8 ep4 (serve_deepseek-v4-flash.sh), xlarge, dummy weights
 Native, SAVE and LOAD all run with the variables of recipe/sglang/set_env.sh (a value
@@ -148,6 +149,12 @@ CASES = [
           ["--tp-size", "2", "--ep-size", "2"] + _DEEPEP
           + ["--chunked-prefill-size", "256", "--attention-backend", "fa3", "--max-running-requests", "512"],
           _decode_step(2, MAXBS), memfrac=0.8, weights="real", env=_EP_ENV),
+    # Not a recipe: q35_tpep2 without an all-to-all backend, so the standard dispatcher
+    # maps global to local expert ids for the triton runner (graph_ops.bootstrap_ep_expert_maps).
+    _case("q35_tpep2_a2a_none", _Q35, 2,
+          ["--tp-size", "2", "--ep-size", "2", "--moe-a2a-backend", "none", "--moe-runner-backend", "triton",
+           "--chunked-prefill-size", "256", "--attention-backend", "fa3", "--max-running-requests", "512"],
+          _decode_max(MAXBS), memfrac=0.8, weights="real"),  # bs 1 too: sequential decode runs a graph
     # serve_qwen3.5-122ba10b.sh ep4 (common args :49-53): model :8, mamba :17 / :51,
     # GRAPHS :18-19, TOPO :22-24, env :39, MEMFRAC :43.
     _case("q35_122b_fp8_ep4", "Qwen/Qwen3.5-122B-A10B-FP8", 4,

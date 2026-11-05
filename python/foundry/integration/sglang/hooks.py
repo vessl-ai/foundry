@@ -333,6 +333,7 @@ def _begin_graph_layout(model, mode) -> None:
     from foundry.integration.sglang.graph_ops import (
         bootstrap_collective_connections,
         bootstrap_deepep_buffer,
+        bootstrap_ep_expert_maps,
         bootstrap_lazy_runtimes,
         bootstrap_logits_gatherer,
     )
@@ -354,7 +355,13 @@ def _begin_graph_layout(model, mode) -> None:
     rt.log_alloc_offset("before_deepep_bootstrap")
     bootstrap_deepep_buffer(model)
     rt.log_alloc_offset("after_deepep_bootstrap")
-    # 4. SAVE only, every model: the two one-time runtime initializations
+    # 4. The standard dispatchers' EP expert maps (both modes; a no-op without
+    #    EP or with a runner that keeps global ids): otherwise allocated in the
+    #    first captured forward and filled only when that graph replays.
+    rt.log_alloc_offset("before_ep_expert_maps")
+    bootstrap_ep_expert_maps(model)
+    rt.log_alloc_offset("after_ep_expert_maps")
+    # 5. SAVE only, every model: the two one-time runtime initializations
     #    capture rejects (inductor's lazy init, DeepGEMM's runtime init), with
     #    the allocation region suspended so their transient tensors never move
     #    the deterministic cursor. The model's own compiles and JIT kernel
@@ -363,7 +370,7 @@ def _begin_graph_layout(model, mode) -> None:
         with rt.allocation_region_suspended():
             bootstrap_lazy_runtimes()
         rt.log_alloc_offset("after_lazy_runtimes")
-    # 5. Both modes, before the first eager extend: the FlashInfer SM90 GDN
+    # 6. Both modes, before the first eager extend: the FlashInfer SM90 GDN
     #    prefill kernels load from FlashInfer's .o cache instead of compiling
     #    8-10 s in every scheduler (host-side patch, see flashinfer_cute_cache).
     from foundry.integration.sglang import flashinfer_cute_cache

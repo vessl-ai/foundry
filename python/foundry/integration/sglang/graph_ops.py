@@ -829,6 +829,68 @@ def _bootstrap_deepep_v2_buffer(model) -> bool:
     return False
 
 
+def bootstrap_ep_expert_maps(model) -> int:
+    """Build every ``StandardDispatcher``'s ``local_expert_mapping`` BEFORE the
+    cuda-graph capture loop, on SAVE and LOAD alike.
+
+    Under EP with a runner that takes local expert ids (triton, deep_gemm, ...)
+    and ``--moe-a2a-backend none``, sglang builds the global -> local expert map
+    lazily in the first ``dispatch()``, normally one of the warmup forwards.
+    Foundry runs none, so the first captured forward allocates the map and only
+    records the kernels that fill it; they run when that one graph replays.
+    Measured on Qwen3-30B-A3B tp2/ep2, triton runner: the SAVE engine's first
+    eager prefill already reads the unfilled map (greedy output differs from
+    native from token 0), and on LOAD every decode graph does (from token 1).
+
+    Built here, outside capture, the map exists and is filled before the
+    first graph, at the same sequence point on both modes. The code mirrors
+    the lazy block in ``StandardDispatcher.dispatch``. Returns the number of
+    maps built (0 without EP, or when the runner keeps global expert ids).
+    """
+    import torch
+
+    try:
+        from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
+    except Exception:
+        return 0
+    built = 0
+    t0 = time.perf_counter()
+    for module in model.modules():
+        dispatcher = getattr(module, "dispatcher", None)
+        if dispatcher is None:
+            continue
+        for d in (dispatcher, *getattr(dispatcher, "_inners", [])):
+            if not isinstance(d, StandardDispatcher):
+                continue
+            if (
+                d.moe_ep_size <= 1
+                or d.skip_local_expert_mapping
+                or d.local_expert_mapping is not None
+            ):
+                continue
+            device = torch.device("cuda", torch.cuda.current_device())
+            routed, shared = d.num_local_routed_experts, d.num_local_shared_experts
+            mapping = torch.full((d.num_experts,), -1, dtype=torch.int32, device=device)
+            start = d.moe_ep_rank * routed
+            mapping[start : start + routed] = torch.arange(
+                0, routed, dtype=torch.int32, device=device
+            )
+            if shared > 0:
+                mapping[-shared:] = torch.arange(
+                    routed, routed + shared, dtype=torch.int32, device=device
+                )
+            d.local_expert_mapping = mapping
+            built += 1
+    if built:
+        torch.cuda.synchronize()
+        logger.info(
+            "[Foundry] Built %d EP local expert maps pre-capture in %.3fs",
+            built,
+            time.perf_counter() - t0,
+        )
+    return built
+
+
 @dataclass
 class _DecodeRestore:
     pending: Any
