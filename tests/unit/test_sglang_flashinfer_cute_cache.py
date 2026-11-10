@@ -134,3 +134,46 @@ def test_patch_is_on_by_default(monkeypatch):
     assert fcc.enabled()
     monkeypatch.setenv(fcc.OPT_OUT_ENV, "0")
     assert not fcc.enabled()
+
+
+class _SGLangAOTCache(dict):
+    """Stands in for SGLang's ``_FlashInferGDNCache``: storing a kernel exports
+    it, which a kernel reloaded from FlashInfer's ``.o`` cannot do."""
+
+    def __setitem__(self, key, value):
+        if not hasattr(value, "export_to_c"):
+            raise AttributeError("object has no attribute 'export_to_c'")
+        super().__setitem__(key, value)
+
+
+_SGLangAOTCache.__module__ = fcc.SGLANG_GDN_FLASHINFER
+
+
+def test_sglang_aot_cache_present_leaves_flashinfer_unpatched(fake_flashinfer):
+    f = fake_flashinfer
+    f.ccc._in_mem_compile_cache = _SGLangAOTCache()
+    status = fcc.install()
+    assert status.startswith("not patched: SGLang's CuTe AOT cache") and "_SGLangAOTCache" in status
+    assert f.ccc.cached_compile is f.sibling.cached_compile is f.original
+    assert fcc.install() is status
+    assert fcc.sglang_owns_cache(f.ccc._in_mem_compile_cache)
+    assert not fcc.sglang_owns_cache({})
+
+
+def test_sglang_aot_cache_installed_later_gets_flashinfers_own_compile(fake_flashinfer):
+    f = fake_flashinfer
+    calls = []
+
+    def flashinfer_cached_compile(func, *args, compile_options=None, **kwargs):
+        calls.append((func, args, compile_options))
+        return "flashinfer"
+
+    f.ccc.cached_compile = f.sibling.cached_compile = flashinfer_cached_compile
+    assert "build_and_load_cute_dsl_kernel" in fcc.install()
+    assert f.sibling.cached_compile is f.ccc.cached_compile is not flashinfer_cached_compile
+    f.ccc._in_mem_compile_cache = _SGLangAOTCache()
+    kernel = _Kernel((("dtype", "bf16"),))
+    assert f.ccc.cached_compile(kernel, 1, compile_options="sm90") == "flashinfer"
+    assert f.sibling.cached_compile(kernel, 2, compile_options="sm90") == "flashinfer"
+    assert calls == [(kernel, (1,), "sm90"), (kernel, (2,), "sm90")]
+    assert f.log == [] and dict(f.ccc._in_mem_compile_cache) == {}

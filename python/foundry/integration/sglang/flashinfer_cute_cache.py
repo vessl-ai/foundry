@@ -10,6 +10,17 @@ one process compiles and every later one loads. Applied on SAVE and LOAD
 before the capture loop when SGLang's FlashInfer GDN kernel module is loaded;
 ``FOUNDRY_FLASHINFER_GDN_CUTE_CACHE=0`` turns it off (in-process compile,
 8-10 s per scheduler at the first extend).
+
+SGLang's own CuTe AOT cache (``_enable_gdn_aot_cache`` in its
+``gdn_flashinfer`` module) replaces ``_in_mem_compile_cache`` with a dict
+that exports every stored kernel to ``SGLANG_CUTE_AOT_CACHE_DIR``. When that
+cache is present, it already persists these kernels, and a kernel from
+FlashInfer's ``.o`` cache cannot go into it: ``build_and_load_cute_dsl_kernel``
+returns the kernel reloaded from the ``.o`` (a TVM-FFI function without
+``export_to_c``), so SGLang's export would raise at the first extend. Foundry
+then leaves ``cached_compile`` to FlashInfer: :func:`install` does not patch
+when the cache is already SGLang's, and the patched function hands the call
+back to FlashInfer's own when SGLang installs its cache later.
 """
 
 from __future__ import annotations
@@ -54,11 +65,18 @@ def gdn_flashinfer_in_use() -> bool:
     return SGLANG_GDN_FLASHINFER in sys.modules
 
 
+def sglang_owns_cache(cache: Any) -> bool:
+    """``cache`` (FlashInfer's ``_in_mem_compile_cache``) was put there by
+    SGLang, i.e. SGLang persists the compiled kernels itself."""
+    return type(cache).__module__.startswith("sglang.")
+
+
 def install() -> str | None:
     """Route ``custom_compile_cache.cached_compile`` (and the name as already
     imported by the delta_rule modules) through FlashInfer's persistent
-    ``.o`` cache. Returns a status string for the log, or None when this
-    FlashInfer has no such module or helper (nothing to do). Idempotent."""
+    ``.o`` cache, unless SGLang's CuTe AOT cache already holds the dict (see
+    the module docstring). Returns a status string for the log, or None when
+    this FlashInfer has no such module or helper (nothing to do). Idempotent."""
     global _installed
     if _installed is not None:
         return _installed
@@ -76,11 +94,21 @@ def install() -> str | None:
     if build_and_load is None or original is None or in_mem is None or options_key is None:
         logger.debug("[Foundry] FlashInfer CuTe-DSL cache patch not applicable (API)")
         return None
+    if sglang_owns_cache(in_mem):
+        cache_type = type(in_mem)
+        _installed = (
+            f"not patched: SGLang's CuTe AOT cache ({cache_type.__module__}."
+            f"{cache_type.__qualname__}) persists the delta_rule_dsl kernels"
+        )
+        return _installed
     sources = sorted(glob.glob(os.path.join(os.path.dirname(ccc.__file__), "*.py")))
 
     def cached_compile(func, *args, compile_options=None, **kwargs):
+        cache = ccc._in_mem_compile_cache
+        if sglang_owns_cache(cache):
+            return original(func, *args, compile_options=compile_options, **kwargs)
         key = (func._get_compile_key(), options_key(compile_options))
-        compiled = in_mem.get(key)
+        compiled = cache.get(key)
         if compiled is not None:
             return compiled
         key_text = repr(key)
@@ -98,7 +126,7 @@ def install() -> str | None:
             name = kernel_name(func, key_text)
             logger.info("[Foundry] CuTe-DSL cache: %s <- %s", name, key_text)
             compiled = build_and_load(CACHED_OPS_MODULE, name, compile_fn, sources)
-        in_mem[key] = compiled
+        cache[key] = compiled
         return compiled
 
     ccc.cached_compile = cached_compile

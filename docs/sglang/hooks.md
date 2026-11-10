@@ -86,7 +86,9 @@ with its all-reduce through torch symmetric memory (validated attn-TP + EP rows 
   SAVE and LOAD reach the layout start at the same cursor.
 - **GDN CuTe-DSL cache** (both modes, after the bootstraps, only when the FlashInfer SM90 GDN prefill kernels are in
   use): the kernels load from FlashInfer's `.o` cache instead of compiling in every scheduler; on by default
-  (`FOUNDRY_FLASHINFER_GDN_CUTE_CACHE=0` turns it off). Host-side only.
+  (`FOUNDRY_FLASHINFER_GDN_CUTE_CACHE=0` turns it off). Host-side only. Not applied when SGLang's own CuTe AOT
+  cache holds FlashInfer's compile dict (`SGLANG_CUTE_AOT_CACHE_DIR`): SGLang then persists these kernels itself,
+  and its export cannot take a kernel reloaded from FlashInfer's `.o`.
 - **No backend-specific code.** LOAD runs the upstream loop, so sglang itself re-creates all per-shape host state
   (FlashInfer / fa3 / hybrid decode metadata, the `deepep_adapter` captured mode, TBO / LoRA buffers) exactly as on
   SAVE. Restored graphs never run `run_once`, so they carry no in-graph shared-read marker; SGLang's

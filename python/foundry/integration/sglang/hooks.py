@@ -384,7 +384,8 @@ def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> N
         rt.log_alloc_offset("after_lazy_runtimes")
     # 3. Both modes, before the first eager extend: the FlashInfer SM90 GDN
     #    prefill kernels load from FlashInfer's .o cache instead of compiling
-    #    8-10 s in every scheduler (host-side patch, see flashinfer_cute_cache).
+    #    8-10 s in every scheduler (host-side patch, see flashinfer_cute_cache;
+    #    not applied when SGLang's own CuTe AOT cache already persists them).
     from foundry.integration.sglang import flashinfer_cute_cache
 
     if flashinfer_cute_cache.gdn_flashinfer_in_use():
